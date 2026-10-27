@@ -196,3 +196,5 @@ See `privacy-policy.md`, or send `/privacy` in the bot. In short: memory and rem
 stored **per user, keyed by Telegram ID**; message content is sent to Google Gemini (and Groq
 as a fallback) to produce replies; media is processed but not kept; `/memory` shows what is
 held and `/forget` deletes it.
+
+Group commands: `/rules`, `/setup`, `/welcome`, `/stats`, `/members`.

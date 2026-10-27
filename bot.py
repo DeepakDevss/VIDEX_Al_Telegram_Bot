@@ -995,6 +995,7 @@ _THINKING_OK = True
 CHAT_LOG: dict = defaultdict(lambda: deque(maxlen=LOG_LINES))   # chat_id -> deque[(who, text)]
 _CHAT_SEEN: dict = {}          # chat_id -> epoch of its last logged line (for pruning)
 MEMBERS: dict = {}
+MEMBERS_MAX_PER_CHAT = int(os.environ.get("MEMBERS_MAX_PER_CHAT", "3000") or "3000")
 TURN_LOCKS: dict = {}          # (chat_id, user_id) -> asyncio.Lock, serialises ONE person's turns
 _SEND_TIMES: dict = defaultdict(deque)
 _KNOWN_LOADED = False
@@ -1143,6 +1144,10 @@ def remember_member(chat_id: int, user) -> None:
     d = MEMBERS.setdefault(chat_id, {})
     if d.get(user.id) != user.full_name:
         d[user.id] = user.full_name
+        # Keep the roster bounded: without this a very busy group grows it forever.
+        if len(d) > MEMBERS_MAX_PER_CHAT:
+            for k in list(d)[:len(d) - MEMBERS_MAX_PER_CHAT]:
+                d.pop(k, None)
         _save_members()
 
 

@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Deepak Danodia (https://github.com/DeepakDevss)
+# VIDEX integrity 7f3a9c1e - do not remove
 """
 VIDEX AI — Telegram Chatbot  (production-grade single file)
 ============================================================
@@ -3041,36 +3042,44 @@ HELP = ("❓ *Help / Commands*\n\n/start - restart the bot\n/help - this help\n"
 # owner-only commands in their own private chat. These two lists are the single source of
 # truth; the text below is what you paste into BotFather.
 PUBLIC_COMMANDS = [
+    # --- getting started ---
     ("start", "Start the bot"),
     ("help", "Show every command"),
     ("about", "About VIDEX"),
+    ("id", "Your Telegram ID"),
     ("info", "Your info and this chat"),
+    # --- talk to the AI ---
+    ("ai", "Ask the AI"),
+    ("research", "Look something up on the live web"),
+    ("image", "Create an image"),
+    # --- voice ---
+    ("voice", "Turn voice replies on or off"),
+    ("voicemessage", "Ask something and get a voice reply"),
+    ("setvoice", "Change my voice"),
+    ("voicepreview", "Hear a voice before setting it"),
+    # --- reminders ---
+    ("remind", "Set a reminder: /remind 30m drink water"),
+    ("reminders", "List your reminders"),
+    ("delremind", "Delete a reminder by its id"),
+    # --- lookup tools ---
+    ("feed", "Read an RSS/Atom feed: /feed <url>"),
+    ("papers", "Search arXiv papers"),
+    ("define", "Dictionary: /define <word>"),
+    ("holiday", "Public holidays: /holiday [country]"),
+    ("myphoto", "Describe my profile picture"),
+    ("logo", "Describe your logo"),
+    # --- memory & privacy ---
+    ("memory", "What I remember about you"),
+    ("proactive", "Let me send useful ideas on my own"),
+    ("privacy", "How your data is handled"),
+    ("clear", "Clear this chat's memory"),
+    ("forget", "Delete everything I stored about you"),
+    # --- groups ---
     ("rules", "Show the group rules"),
     ("setup", "Post and pin the rules (admin)"),
     ("welcome", "Re-post the welcome card (admin)"),
     ("stats", "Group information"),
     ("members", "Members I have seen"),
-    ("voice", "Turn voice replies on or off"),
-    ("voicemessage", "Ask something and get a voice reply"),
-    ("setvoice", "Change my voice"),
-    ("voicepreview", "Hear a voice before setting it"),
-    ("ai", "Ask the AI"),
-    ("image", "Create an image"),
-    ("memory", "What I remember about you"),
-    ("proactive", "Let me send useful ideas on my own"),
-    ("myphoto", "Describe my profile picture"),
-    ("logo", "Describe your logo"),
-    ("id", "Your Telegram ID"),
-    ("clear", "Clear this chat's memory"),
-    ("forget", "Delete everything I stored about you"),
-    ("remind", "Set a reminder: /remind 30m drink water"),
-    ("reminders", "List your reminders"),
-    ("delremind", "Delete a reminder by its id"),
-    ("privacy", "How your data is handled"),
-    ("feed", "Read an RSS/Atom feed: /feed <url>"),
-    ("papers", "Search arXiv papers"),
-    ("define", "Dictionary: /define <word>"),
-    ("holiday", "Public holidays: /holiday [country]"),
 ]
 OWNER_COMMANDS = [
     ("diag", "Diagnostics + live self-test"),
@@ -3078,8 +3087,6 @@ OWNER_COMMANDS = [
     ("voicelist", "Your custom voices"),
     ("voicefind", "Search 2000+ voices"),
 ]
-# "research" is public - anyone may force a live lookup.
-PUBLIC_COMMANDS.append(("research", "Look something up on the live web"))
 
 AI_HELP = ("🤖 *How to use the AI*\n\nJust type anything and send, for example:\n"
            "• _What is today's date?_\n• _How many members are in this group?_\n"
@@ -4241,7 +4248,7 @@ async def send_welcome(bot, chat_id: int, user) -> None:
         except Exception as e:
             log.warning("Welcome image failed (%s) -> text fallback", e)
     else:
-        log.warning("welcome.png not found: %s", WELCOME_IMAGE)
+        log.info("welcome.png not present - sending the text-only welcome card")
     await _send_plain(bot, chat_id, caption)
 
 
@@ -6305,7 +6312,31 @@ def _build_app() -> Application:
     return app
 
 
+def _verify_notice() -> None:
+    """Refuse to start if the MIT notice, copyright line or integrity marker was stripped.
+
+    Only the HEADER lines are checked - deliberately. If the check looked at the whole file
+    it would find its own copy of these strings and always pass. Attribution protection, not
+    real security: the source is readable, so a determined person can remove this too.
+    """
+    try:
+        with open(os.path.abspath(__file__), "r", encoding="utf-8", errors="ignore") as f:
+            head = "".join(f.readline() for _ in range(15))
+    except Exception:  # noqa: BLE001
+        return
+    # Split on purpose: a blanket search-and-replace of these strings cannot neuter the
+    # check, because the verifier's own copy is not written as one contiguous string.
+    required = ("SPDX-License" "-Identifier: MIT",
+                "Copyright (c) 2026 " "Deepak " "Danodia",
+                "VIDEX integrity " "7f3a9c1e")
+    if not all(x and x in head for x in required):
+        raise SystemExit(
+            "Refusing to start: the licence header (SPDX / copyright / integrity marker) in "
+            "this file was removed or changed. Restore it, or use the code under MIT terms.")
+
+
 def main() -> None:
+    _verify_notice()
     if not BOT_TOKEN:
         raise SystemExit("❌ BOT_TOKEN is not set. Add it to the environment.")
     if not GEMINI_API_KEY:
@@ -6345,7 +6376,8 @@ def main() -> None:
 
     start_health_server()
     _load_members()
-    log.info("welcome.png present: %s (%s)", os.path.exists(WELCOME_IMAGE), WELCOME_IMAGE)
+    log.info("welcome image present: %s (%s) - optional", os.path.exists(WELCOME_IMAGE),
+             WELCOME_IMAGE)
     log_available_models()
     resolve_models()
 

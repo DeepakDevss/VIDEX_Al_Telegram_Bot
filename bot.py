@@ -688,7 +688,7 @@ SYSTEM_PROMPT = (
     "  (Sent as the ONLY content. The bot then sends nothing at all.)"
     "\n"
     "=== LAYER 8c — YOUR OWN TOOLS (silent; use only when they genuinely help) ===\n"
-    "You have six tools. They run SILENTLY: the person is never told, so NEVER mention a "
+    "You have nine tools. They run SILENTLY: the person is never told, so NEVER mention a "
     "tool, never say you 'searched' or 'made a file', and never print these tags as text - "
     "they are instructions, not content.\n"
     "1. [search: <query>] - look something up on the live web. YOU MUST USE IT whenever the "
@@ -731,6 +731,13 @@ SYSTEM_PROMPT = (
     "percentages, totals, unit maths, big multiplications - instead of doing it in your head. "
     "Emit the tag ALONE on its own line; the system computes it and asks you again with the "
     "exact result. Allowed: numbers and + - * / // % ** and brackets.\n"
+    "7. [convert: 100 usd to inr] - unit/currency conversion. Use it for ANY conversion "
+    "(km/miles, kg/lb, celsius/fahrenheit, dollars/rupees, GB/MB) instead of estimating - "
+    "currency uses live rates.\n"
+    "8. [date: 2026-11-08] - exact date arithmetic. Give an ISO date, or 'age 1995-06-15', "
+    "or '+30'. Use it for 'kitne din baaki', 'kaun sa din hoga', 'meri age kitni'.\n"
+    "9. [time: America/New_York] - exact current time in another timezone (IANA name). Use "
+    "it for 'NY me kitne baje hain'.\n"
     "- At most ONE of these per reply, and MOST replies should use NONE. Ordinary "
     "conversation is the default; tools are the exception. They are rate-limited per chat, "
     "so if one is skipped the reply is simply sent without it - never promise an attachment "
@@ -1025,7 +1032,8 @@ _KNOWN_LOADED = False
 # A user must not be able to poison the transcript the model reads: no faking the
 # 'Name: what they said' format, and no injecting our internal tags.
 _TAG_INJECT_RE = re.compile(
-    r"\[(?:react|quote|remember|image|calc|search|file|voice|remind)\b[^\]]*\]", re.I)
+    r"\[(?:react|quote|remember|image|calc|search|file|voice|remind|convert|date|time)\b[^\]]*\]",
+    re.I)
 _FAKE_NAME_RE = re.compile(r"^\s*[A-Za-z0-9_@.\- ]{1,32}:\s+")
 # Characters used to smuggle hidden instructions past the model: zero-width spaces/joiners,
 # bidi controls, the Unicode tag block (U+E0000-E007F), variation selectors and other format
@@ -1312,6 +1320,9 @@ def clean_reply(text: str) -> str:
     t = _FILE_BLOCK_RE.sub("", t)      # whole file blocks first (they span lines)
     t = _SEARCH_TAG_RE.sub("", t)
     t = _CALC_RE.sub("", t)
+    t = _CONVERT_RE.sub("", t)
+    t = _DATE_RE.sub("", t)
+    t = _TIME_RE.sub("", t)
     t = _REMIND_TAG_RE.sub("", t)
     t = _VOICE_TAG_RE.sub("", t)
     t = _AUTO_IMAGE_RE.sub("", t)
@@ -1849,7 +1860,8 @@ async def build_context(u: Update, bot, lang: str, media_state: str = "none",
     chat = u.effective_chat
     lines = [
         "=== LIVE CONTEXT (answer from this; never contradict it) ===",
-        f"Current date and time: {now.strftime('%d %b %Y, %I:%M %p')} {now.tzname()}.",
+        f"Current date and time: {now.strftime('%A, %d %b %Y, %I:%M %p')} {now.tzname()} "
+        f"(year {now.year}). Use this for any 'today/tomorrow/this week/which day' question.",
         f"The person speaking now: {user.full_name} (Telegram ID {user.id}).",
         ("They sent an ALBUM of several photos at once - look at ALL of them, and compare "
          "them if they are related." if media_state == "images_loaded" else ""),
@@ -2168,6 +2180,134 @@ def safe_calc(expr: str):
     if abs(val) > 1e18:
         return None
     return val
+
+# ---- Exact tools: things a language model gets WRONG in its head -----------------------
+# Unit/currency conversion, date arithmetic and other time zones are computed here in Python,
+# so the number the user sees is exact instead of "roughly right".
+_CONV = {
+    "mm": ("len", 0.001), "millimetre": ("len", 0.001), "millimeter": ("len", 0.001),
+    "cm": ("len", 0.01), "centimetre": ("len", 0.01), "centimeter": ("len", 0.01),
+    "m": ("len", 1.0), "metre": ("len", 1.0), "meter": ("len", 1.0),
+    "km": ("len", 1000.0), "kilometre": ("len", 1000.0), "kilometer": ("len", 1000.0),
+    "inch": ("len", 0.0254), "inches": ("len", 0.0254), "in": ("len", 0.0254),
+    "ft": ("len", 0.3048), "foot": ("len", 0.3048), "feet": ("len", 0.3048),
+    "yard": ("len", 0.9144), "yards": ("len", 0.9144),
+    "mile": ("len", 1609.344), "miles": ("len", 1609.344),
+    "mg": ("mass", 1e-6), "g": ("mass", 0.001), "gram": ("mass", 0.001),
+    "gm": ("mass", 0.001), "kg": ("mass", 1.0), "kgs": ("mass", 1.0),
+    "kilogram": ("mass", 1.0), "quintal": ("mass", 100.0),
+    "tonne": ("mass", 1000.0), "ton": ("mass", 1000.0),
+    "oz": ("mass", 0.028349523125), "ounce": ("mass", 0.028349523125),
+    "lb": ("mass", 0.45359237), "lbs": ("mass", 0.45359237), "pound": ("mass", 0.45359237),
+    "ml": ("vol", 0.001), "l": ("vol", 1.0), "litre": ("vol", 1.0), "liter": ("vol", 1.0),
+    "gallon": ("vol", 3.785411784), "gallons": ("vol", 3.785411784),
+    "cup": ("vol", 0.24), "cups": ("vol", 0.24),
+    "sqm": ("area", 1.0), "sqft": ("area", 0.09290304),
+    "acre": ("area", 4046.8564224), "acres": ("area", 4046.8564224),
+    "hectare": ("area", 10000.0), "hectares": ("area", 10000.0),
+    "kmph": ("speed", 1.0), "kmh": ("speed", 1.0), "kph": ("speed", 1.0),
+    "mph": ("speed", 1.609344),
+    "kb": ("data", 1024.0), "mb": ("data", 1048576.0), "gb": ("data", 1073741824.0),
+    "tb": ("data", 1099511627776.0),
+}
+_TEMP_ALIASES = {"c": "C", "celsius": "C", "f": "F", "fahrenheit": "F",
+                 "k": "K", "kelvin": "K"}
+_FX_ALIASES = {"dollar": "usd", "dollars": "usd", "usd": "usd", "$": "usd",
+               "rupee": "inr", "rupees": "inr", "inr": "inr", "rs": "inr",
+               "euro": "eur", "euros": "eur", "eur": "eur",
+               "pound": "gbp", "pounds": "gbp", "gbp": "gbp",
+               "yen": "jpy", "jpy": "jpy", "dirham": "aed", "aed": "aed",
+               "taka": "bdt", "bdt": "bdt", "yuan": "cny", "cny": "cny"}
+_CONVERT_RE = re.compile(r"\[\s*convert\s*:\s*([^\]\n]{2,80})\]", re.I)
+_DATE_RE = re.compile(r"\[\s*date\s*:\s*([^\]\n]{2,40})\]", re.I)
+_TIME_RE = re.compile(r"\[\s*time\s*:\s*([^\]\n]{2,60})\]", re.I)
+
+
+def _num(x: float) -> str:
+    return f"{x:,.2f}" if abs(x) >= 1000 else f"{x:.4g}"
+
+
+async def _convert(text: str) -> str:
+    """'100 usd to inr' | '5 km in miles' | '30 c to f' -> an EXACT conversion line."""
+    t = (text or "").strip().lower().replace(",", "")
+    m = re.match(r"^(-?[\d.]+)\s*([a-z$\u00b0]+)\.?\s*(?:to|in|into|=|->|me|mein)\s*"
+                 r"([a-z$\u00b0]+)\.?$", t)
+    if not m:
+        return ""
+    try:
+        val = float(m.group(1))
+    except ValueError:
+        return ""
+    a = m.group(2).strip("\u00b0.")
+    b = m.group(3).strip("\u00b0.")
+    if a in _TEMP_ALIASES and b in _TEMP_ALIASES:
+        A, B = _TEMP_ALIASES[a], _TEMP_ALIASES[b]
+        c = val if A == "C" else ((val - 32) * 5 / 9 if A == "F" else val - 273.15)
+        out = c if B == "C" else (c * 9 / 5 + 32 if B == "F" else c + 273.15)
+        return f"{_num(val)}\u00b0{A} = {_num(out)}\u00b0{B}"
+    if a in _FX_ALIASES and b in _FX_ALIASES:
+        fa, fb = _FX_ALIASES[a], _FX_ALIASES[b]
+        d = await _cdn_rates()
+        rate = None
+        if fa == "usd":
+            rate = d.get(fb)
+        elif fb == "usd":
+            rate = (1.0 / d[fa]) if d.get(fa) else None
+        elif d.get(fa) and d.get(fb):
+            rate = d.get(fb) / d.get(fa)
+        if rate:
+            return (f"{_num(val)} {fa.upper()} = {_num(val * rate)} {fb.upper()} "
+                    f"(live rate 1 {fa.upper()} = {_num(rate)} {fb.upper()})")
+        return ""
+    if a in _CONV and b in _CONV:
+        da, fa = _CONV[a]
+        db, fb = _CONV[b]
+        if da != db:
+            return ""
+        return f"{_num(val)} {a} = {_num(val * fa / fb)} {b}"
+    return ""
+
+
+def _date_math(text: str) -> str:
+    """'2026-11-08' | 'age 1995-06-15' | '+30' -> an EXACT date fact."""
+    t = (text or "").strip().lower()
+    today = now_local().date()
+    if t.startswith("age "):
+        try:
+            d = datetime.date.fromisoformat(t[4:].strip())
+        except ValueError:
+            return ""
+        yrs = today.year - d.year - ((today.month, today.day) < (d.month, d.day))
+        return f"born {d.isoformat()} -> age {yrs} years ({(today - d).days:,} days)"
+    m = re.match(r"^([+-]\d{1,5})$", t)
+    if m:
+        d = today + datetime.timedelta(days=int(m.group(1)))
+        return (f"{m.group(1)} days from today ({today.isoformat()}, {today.strftime('%A')}) "
+                f"= {d.isoformat()} ({d.strftime('%A')})")
+    try:
+        d = datetime.date.fromisoformat(t)
+    except ValueError:
+        return ""
+    delta = (d - today).days
+    rel = "today" if delta == 0 else (f"in {delta} days" if delta > 0 else f"{-delta} days ago")
+    return (f"{d.isoformat()} is a {d.strftime('%A')} - {rel} "
+            f"(today is {today.isoformat()}, {today.strftime('%A')})")
+
+
+def _time_in_zone(text: str) -> str:
+    """'Asia/Kolkata' or 'America/New_York' -> the exact current time there."""
+    t = (text or "").strip()
+    if not t:
+        return ""
+    try:
+        z = ZoneInfo(t)
+    except Exception:  # noqa: BLE001
+        return ""
+    there = datetime.datetime.now(z)
+    here = now_local()
+    return (f"{t}: {there.strftime('%I:%M %p, %d %b %Y (%A)')}  "
+            f"[user's time: {here.strftime('%I:%M %p, %d %b %Y')}]")
+
 
 # A message that is plainly about something that CHANGES over time. Used only as a SAFETY
 # NET: the model is still the primary decider, but in practice it often answered
@@ -3831,6 +3971,37 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 ans2 = await ask_gemini(
                     chat_id, prompt,
                     _guard(ctx + f"\n\n=== CALCULATOR (exact) ===\n{expr} = {val}\n"
+                                 "Use this exact result in your answer; do not recompute it."),
+                    image, audio, doc)
+                if ans2:
+                    ans = ans2
+                else:
+                    break
+            # ---- EXACT TOOLS: convert / date / time --------------------------------
+            # The model asks with a tag, we compute the exact value in Python and let it
+            # answer again with the number in hand. Same bounded shape as the calc loop.
+            for _x in range(RESEARCH_MAX_ROUNDS):
+                got, label = "", ""
+                cm = _CONVERT_RE.search(ans or "")
+                if cm:
+                    ans = _CONVERT_RE.sub("", ans or "")
+                    got, label = await _convert(cm.group(1)), "CONVERTER (exact)"
+                if not got:
+                    dm = _DATE_RE.search(ans or "")
+                    if dm:
+                        ans = _DATE_RE.sub("", ans or "")
+                        got, label = _date_math(dm.group(1)), "DATE MATH (exact)"
+                if not got:
+                    tm = _TIME_RE.search(ans or "")
+                    if tm:
+                        ans = _TIME_RE.sub("", ans or "")
+                        got, label = _time_in_zone(tm.group(1)), "TIME ZONE (exact)"
+                if not got:
+                    break
+                log.info("exact tool %s -> %s", label, got[:80])
+                ans2 = await ask_gemini(
+                    chat_id, prompt,
+                    _guard(ctx + f"\n\n=== {label} ===\n{got}\n"
                                  "Use this exact result in your answer; do not recompute it."),
                     image, audio, doc)
                 if ans2:

@@ -1035,6 +1035,15 @@ _TAG_INJECT_RE = re.compile(
     r"\[(?:react|quote|remember|image|calc|search|file|voice|remind|convert|date|time)\b[^\]]*\]",
     re.I)
 _FAKE_NAME_RE = re.compile(r"^\s*[A-Za-z0-9_@.\- ]{1,32}:\s+")
+# A tag the model STARTED but never closed ("[calc: 15*3" with no "]"). A truncated reply or
+# a streaming cut-off used to leak that verbatim to the person. Tags never span a line.
+_UNCLOSED_TAG_RE = re.compile(
+    r"\[(?:react|quote|remember|image|calc|search|file|voice|remind|convert|date|time)\b"
+    r"[^\]\n]*$", re.I | re.M)
+
+
+def _strip_unclosed_tags(text: str) -> str:
+    return _UNCLOSED_TAG_RE.sub("", text or "")
 # Characters used to smuggle hidden instructions past the model: zero-width spaces/joiners,
 # bidi controls, the Unicode tag block (U+E0000-E007F), variation selectors and other format
 # chars. They are invisible in normal text, so they are stripped from every input.
@@ -1061,7 +1070,7 @@ def _sanitize_input(text: str, limit: int = 6000) -> str:
 def log_line(chat_id: int, who: str, text: str) -> None:
     text = _sanitize_input(text)
     text = re.sub(r"\s+", " ", text.strip())
-    text = _TAG_INJECT_RE.sub("", text)
+    text = _strip_unclosed_tags(_TAG_INJECT_RE.sub("", text))
     text = _FAKE_NAME_RE.sub("", text)
     text = text[:LOG_LINE_CHARS]
     if text:
@@ -1243,8 +1252,10 @@ def split_text(text: str, limit: int = None) -> list:
     """Split a long reply into Telegram-sized chunks. Prefers paragraph / sentence / word
     boundaries, and never leaves an emphasis or code marker dangling at the end of a chunk
     (a chunk cut inside '**bold**' used to print raw '**' to the user)."""
-    limit = limit or TG_TEXT_LIMIT
+    limit = max(1, int(limit or TG_TEXT_LIMIT))
     text = text or ""
+    if not text.strip():
+        return []                      # nothing to send - never hand back an empty chunk
     if len(text) <= limit:
         return [text]
     # Leave headroom so re-opening a marker below can never push a chunk past the limit.
@@ -1289,7 +1300,9 @@ def split_text(text: str, limit: int = None) -> list:
 
 # ============================ PART 8: REACTION TAG ============================
 _FULL_TAG_RE = re.compile(r"\[react:\s*([^\]]*?)\s*\]", re.I)
-_ANY_TAG_RE = re.compile(r"\[react:[^\]]*\]", re.I)
+_ANY_TAG_RE = re.compile(
+    r"\[(?:react|quote|remember|image|calc|search|file|voice|remind|convert|date|time)"
+    r"\b[^\]]*\]", re.I)
 _LEAD_TAG_RE = re.compile(r"^\s*\[react:[^\]]*\]\s*", re.I)
 
 
@@ -1328,6 +1341,7 @@ def clean_reply(text: str) -> str:
     t = _AUTO_IMAGE_RE.sub("", t)
     t = _QUOTE_TAG_RE.sub("", _REMEMBER_TAG_RE.sub(
         "", _IMAGE_TAG_RE.sub("", _ANY_TAG_RE.sub("", t))))
+    t = _strip_unclosed_tags(t)        # "[calc: 15*3" with no "]" must never reach a person
     head = t.split("\n", 1)[0]
     if head.lstrip().startswith("[") and "]" not in head:
         t = t.split("\n", 1)[1] if "\n" in t else ""
@@ -1335,7 +1349,7 @@ def clean_reply(text: str) -> str:
 
 
 def strip_tag_partial(text: str) -> str:
-    text = _LEAD_TAG_RE.sub("", text or "", count=1)
+    text = _strip_unclosed_tags(_LEAD_TAG_RE.sub("", text or "", count=1))
     head = text.split("\n", 1)[0]
     if head.lstrip().startswith("[") and "]" not in head:
         text = text.split("\n", 1)[1] if "\n" in text else ""
@@ -2224,6 +2238,15 @@ _TIME_RE = re.compile(r"\[\s*time\s*:\s*([^\]\n]{2,60})\]", re.I)
 
 
 def _num(x: float) -> str:
+    """Format a number for a human. Non-finite values never reach the user."""
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return "0"
+    if x != x or x in (float("inf"), float("-inf")):
+        return "0"
+    if x == 0:
+        x = 0.0                       # kill "-0"
     return f"{x:,.2f}" if abs(x) >= 1000 else f"{x:.4g}"
 
 
@@ -2277,6 +2300,8 @@ def _date_math(text: str) -> str:
             d = datetime.date.fromisoformat(t[4:].strip())
         except ValueError:
             return ""
+        if d > today:
+            return f"{d.isoformat()} is in the future - no age yet"
         yrs = today.year - d.year - ((today.month, today.day) < (d.month, d.day))
         return f"born {d.isoformat()} -> age {yrs} years ({(today - d).days:,} days)"
     m = re.match(r"^([+-]\d{1,5})$", t)
@@ -3490,12 +3515,50 @@ def _should_answer(u: Update, bot) -> bool:
     return False
 
 
+def _synthetic_text(msg) -> str:
+    """A prompt for message types with no text and no downloadable media.
+
+    Stickers, GIFs, shared locations, contact cards and dice used to be dropped silently -
+    the person got NO reply at all. Now they get a natural response.
+    """
+    st = getattr(msg, "sticker", None)
+    if st is not None:
+        em = getattr(st, "emoji", "") or ""
+        return ("(the user sent a sticker" + (f" {em}" if em else "") +
+                " - react to it naturally in one short line, in their language)")
+    if getattr(msg, "animation", None) is not None:
+        return "(the user sent a GIF/animation - react briefly, in their language)"
+    loc = getattr(msg, "location", None)
+    if loc is not None:
+        return (f"(the user shared their location: latitude {loc.latitude:.4f}, "
+                f"longitude {loc.longitude:.4f}. Respond helpfully and briefly.)")
+    con = getattr(msg, "contact", None)
+    if con is not None:
+        nm = " ".join(x for x in (getattr(con, "first_name", ""),
+                                  getattr(con, "last_name", "")) if x).strip()
+        return (f"(the user shared a contact card: {nm or 'someone'} - phone "
+                f"{getattr(con, 'phone_number', '')}. Acknowledge it briefly; never repeat "
+                f"the number unless they ask.)")
+    dice = getattr(msg, "dice", None)
+    if dice is not None:
+        return (f"(the user rolled a {getattr(dice, 'emoji', 'dice')} and got "
+                f"{getattr(dice, 'value', '?')} - comment briefly)")
+    return ""
+
+
 async def on_message(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     msg = u.effective_message
     if msg is None:
         return
     text = _sanitize_input(msg.text or msg.caption or "")
     media = media_from_message(msg)
+    if not text and not media:
+        text = _synthetic_text(msg)
+        loc = getattr(msg, "location", None)
+        if loc is not None:
+            wx = await _weather_at(loc.latitude, loc.longitude)
+            if wx:
+                text += " Live weather there: " + wx
     if not text and not media:
         return
     # An ALBUM arrives as several separate messages that share a media_group_id. Handled
@@ -5388,6 +5451,41 @@ async def _geocode(place: str):
     return None
 
 
+async def _weather_at(lat: float, lon: float) -> str:
+    """Current weather for exact coordinates (Open-Meteo, keyless)."""
+    try:
+        r = await _fetch("https://api.open-meteo.com/v1/forecast",
+                         params={"latitude": round(lat, 4), "longitude": round(lon, 4),
+                                 "current": "temperature_2m,relative_humidity_2m,"
+                                            "weather_code,wind_speed_10m",
+                                 "daily": "temperature_2m_max,temperature_2m_min",
+                                 "timezone": "auto"},
+                         timeout=8, headers={"Accept": "application/json"})
+        if r is None:
+            return ""
+        j = r.json() or {}
+        cur = j.get("current") or {}
+        if not cur:
+            return ""
+        desc = _WMO.get(int(cur.get("weather_code") or 0), "")
+        d = j.get("daily") or {}
+        hi = (d.get("temperature_2m_max") or [None])[0]
+        lo = (d.get("temperature_2m_min") or [None])[0]
+        bits = [desc or "current conditions"]
+        if cur.get("temperature_2m") is not None:
+            bits.append(f"{cur['temperature_2m']}°C")
+        if hi is not None and lo is not None:
+            bits.append(f"(today {lo}°C to {hi}°C)")
+        if cur.get("relative_humidity_2m") is not None:
+            bits.append(f"humidity {cur['relative_humidity_2m']}%")
+        if cur.get("wind_speed_10m") is not None:
+            bits.append(f"wind {cur['wind_speed_10m']} km/h")
+        return ", ".join(str(x) for x in bits)
+    except Exception as e:  # noqa: BLE001
+        log.debug("weather_at failed: %s", str(e)[:80])
+        return ""
+
+
 async def _weather_lookup(query: str) -> str:
     """Live current weather via Open-Meteo (keyless). Geocodes the place named in the query."""
     place = _search_query(query)
@@ -6247,7 +6345,9 @@ def _build_app() -> Application:
                                       chat_member_types=ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.CAPTION | filters.PHOTO | filters.VOICE | filters.AUDIO
-         | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL) & ~filters.COMMAND,
+         | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL
+         | filters.Sticker.ALL | filters.ANIMATION | filters.LOCATION
+         | filters.CONTACT | filters.Dice.ALL) & ~filters.COMMAND,
         on_message))
     app.add_error_handler(on_error)
     return app

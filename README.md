@@ -66,6 +66,7 @@ Create a local environment file from the template:
 cp env.example.txt .env
 ```
 
+The bot loads `.env` itself (via `python-dotenv`), so `python bot.py` picks it up.
 Open `.env` and fill in the values you need. `env.example.txt` lists every supported variable — credentials, model selection, the text-to-speech voice, group behaviour, and memory limits.
 
 Don't commit `.env`. In production, set the same values through your host's secret or environment settings.

@@ -69,6 +69,7 @@ import unicodedata
 import time
 import json
 import html
+import ipaddress
 import wave
 import random
 import shutil
@@ -93,6 +94,16 @@ from telegram.ext import (
 )
 from google import genai
 from google.genai import types
+
+# Optional: load a local .env so `cp env.example.txt .env` actually works for local dev.
+# Python does NOT read .env by itself - without this, a fresh local setup silently had no
+# BOT_TOKEN. Real deployments use the host's environment, and override=False never wins
+# over a real environment variable.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(override=False)
+except Exception:  # noqa: BLE001
+    pass
 
 # ============================ PART 2: CONFIG ============================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
@@ -858,6 +869,10 @@ client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 HTTP = httpx.AsyncClient(timeout=CALL_TIMEOUT, follow_redirects=True)
 HTTP_STT = httpx.AsyncClient(timeout=90)
 CONCURRENT_UPDATES = int(os.environ.get("CONCURRENT_UPDATES", "16") or "16")
+# Keep pending updates across a restart by default: dropping them silently loses messages
+# people sent while the bot was redeploying. Set DROP_PENDING_UPDATES=1 for a clean slate.
+DROP_PENDING_UPDATES = os.environ.get("DROP_PENDING_UPDATES", "false").strip().lower() in (
+    "1", "true", "yes", "on")
 _RATE_LIMITER_ON = False   # set True when PTB's AIORateLimiter is active
 _MODEL_RR = 0              # start position in the chain
 _MODEL_COOLDOWN: dict = {}  # model -> epoch until which it is skipped (just failed)
@@ -921,7 +936,7 @@ USER_BUSY: set = set()
 # for the first to finish (so their messages are answered IN ORDER) before giving up.
 USER_WAIT_MAX = float(os.environ.get("USER_WAIT_MAX", "25") or "25")
 # Optional per-user daily cap on AI answers (0 = no cap). A backstop against slow spam.
-USER_DAILY_CAP = int(os.environ.get("USER_DAILY_CAP", "0") or "0")
+USER_DAILY_CAP = int(os.environ.get("USER_DAILY_CAP", "300") or "300")
 _USER_DAY: dict = {}          # user_id -> (day_key, count)
 # Retention: purge users/chats not seen in this many days (0 = keep forever). Default 90 to
 # match the retention promise in privacy-policy.md - without it that promise was not true.
@@ -964,6 +979,7 @@ async def _compact_memory(uid) -> None:
         notes = MEM.raw_notes(uid)
         if len(notes) < MEM_COMPACT_AT:
             return
+        snapshot = notes[:60]          # EXACTLY what we send to the model
         cur = MEM.get_profile(uid).strip()
         prompt = (
             "You are tidying the long-term memory profile for ONE user of a Telegram assistant. "
@@ -973,11 +989,13 @@ async def _compact_memory(uid) -> None:
             "not lasting. Terse phrases, third person, no fluff, no markdown. If a note "
             "contradicts a newer one, keep the newer. Output ONLY the profile text.\n\n"
             + (f"Existing profile:\n{cur}\n\n" if cur else "")
-            + "Notes:\n" + "\n".join(f"- {n}" for n in notes[:60]))
+            + "Notes:\n" + "\n".join(f"- {n}" for n in snapshot))
         resp = await ask_gemini(uid, "Tidy the memory profile.", prompt)
         if resp and resp != BUSY_MSG and _CANARY not in resp:
             if MEM.set_profile(uid, resp):
-                MEM.clear_notes(uid)
+                # Drop ONLY the notes we compacted. clear_notes() would also delete facts
+                # the user added while the model call was in flight (a real data-loss race).
+                MEM.drop_notes(uid, snapshot)
                 log.info("memory compacted for %s", uid)
     except Exception as e:  # noqa: BLE001
         log.debug("memory compaction failed: %s", str(e)[:120])
@@ -1412,12 +1430,24 @@ def office_to_text(data: bytes) -> str:
     chunks = []
     try:
         z = zipfile.ZipFile(io.BytesIO(data))
+        # A small .docx can expand to gigabytes (a decompression bomb), so cap the TOTAL
+        # DECLARED uncompressed size BEFORE reading any member - truncating afterwards would
+        # already have paid the memory cost.
+        budget = 8 * 1024 * 1024
         for n in z.namelist():
             if not n.endswith(".xml"):
                 continue
             if not any(k in n for k in ("word/document", "word/footnotes", "xl/sharedStrings",
                                         "xl/worksheets", "ppt/slides/slide", "ppt/notesSlides")):
                 continue
+            try:
+                size = z.getinfo(n).file_size
+            except Exception:  # noqa: BLE001
+                continue
+            if size > budget:
+                log.warning("office: skipping a %s-byte member (budget %s)", size, budget)
+                continue
+            budget -= size
             try:
                 xml = z.read(n).decode("utf-8", "ignore")
             except Exception:
@@ -3103,9 +3133,12 @@ async def _info_text(u: Update, c: ContextTypes.DEFAULT_TYPE) -> str:
     chat = u.effective_chat
     now = now_local()
     chat_name = chat.title if chat.type in ("group", "supergroup") else "Private chat"
-    txt = (f"👤 *Name:* {user.full_name}\n"
+    # These are sent with parse_mode=Markdown and both values are user-controlled: an
+    # unescaped _ * ` or [ breaks the whole message (and anyone can rename themselves).
+    _safe = lambda s: re.sub(r"([_*`\[])", r"\\\1", (s or "").strip()[:80])
+    txt = (f"👤 *Name:* {_safe(user.full_name)}\n"
            f"🆔 *User ID:* `{user.id}`\n"
-           f"💬 *Chat:* {chat_name}\n"
+           f"💬 *Chat:* {_safe(chat_name)}\n"
            f"🗓 *Today:* {now.strftime('%d %b %Y, %I:%M %p')} {now.tzname()}")
     txt += await _member_count(c, chat)
     return txt
@@ -3192,7 +3225,27 @@ async def cmd_forget(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
             gone = MEM.forget(uid)
         except Exception as e:  # noqa: BLE001
             log.warning("forget failed: %s", e)
-    CHAT_LOG.pop(u.effective_chat.id, None)
+    # Only THIS person's data. In a group the transcript is shared by everyone, so popping
+    # the whole chat would wipe other members' context - drop just this speaker's lines.
+    _cid = u.effective_chat.id
+    if getattr(u.effective_chat, "type", "private") == "private":
+        CHAT_LOG.pop(_cid, None)
+    else:
+        _q = CHAT_LOG.get(_cid)
+        if _q:
+            _me = (u.effective_user.full_name or "").strip().lower()
+            CHAT_LOG[_cid] = deque((w, t) for (w, t) in _q
+                                   if (w or "").strip().lower() != _me)
+    # The members roster is a second user-keyed store - erase the person there too.
+    try:
+        _removed = False
+        for _c in list(MEMBERS):
+            if MEMBERS[_c].pop(uid, None) is not None:
+                _removed = True
+        if _removed:
+            _save_members()
+    except Exception as e:  # noqa: BLE001
+        log.warning("forget: members cleanup failed: %s", e)
     await u.message.reply_text(
         "🗑️ Done. I deleted everything I had stored about you - your name, username, notes, "
         "language and message counts" + ("" if gone else " (there was nothing stored)") +
@@ -4184,45 +4237,168 @@ def _backoff(r, attempt: int) -> float:
     return max(0.0, delay * (0.5 + random.random()))
 
 
+# ---- SSRF guard -------------------------------------------------------------------------
+# EVERY outbound request goes through _fetch, and _fetch refuses anything that is not a plain
+# public http(s) URL: no localhost, no private/link-local/reserved/multicast address (v4 or
+# v6), no embedded credentials - checked on the literal host AND on every DNS answer, and
+# re-checked on every redirect hop. A user-supplied URL (/feed, a pasted link) therefore can
+# never make the bot call its own health server or a cloud metadata endpoint.
+MAX_FETCH_BYTES = int(os.environ.get("MAX_FETCH_BYTES", str(3 * 1024 * 1024)) or str(3 * 1024 * 1024))
+MAX_REDIRECTS = 3
+
+
+def _ip_is_public(ip) -> bool:
+    return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast
+                or ip.is_reserved or ip.is_unspecified)
+
+
+def _url_is_public(url: str) -> bool:
+    """Cheap structural check (no DNS): scheme, credentials, host, literal IP."""
+    try:
+        p = urllib.parse.urlparse(url or "")
+    except Exception:  # noqa: BLE001
+        return False
+    if p.scheme not in ("http", "https") or not p.hostname:
+        return False
+    if p.username or p.password:
+        return False
+    host = p.hostname.lower()
+    if host in ("localhost", "localhost.localdomain") or host.endswith((".local", ".internal")):
+        return False
+    try:
+        return _ip_is_public(ipaddress.ip_address(host.strip("[]")))
+    except ValueError:
+        return True                       # a name - the DNS check below decides
+
+
+_DNS_OK: dict = {}        # host -> (monotonic, is_public) so we resolve each host once
+_DNS_TTL = 300.0
+
+
+async def _host_is_public(host: str) -> bool:
+    """Resolve the name and reject if ANY answer is a non-public address (cached)."""
+    hit = _DNS_OK.get(host)
+    if hit and (time.monotonic() - hit[0]) < _DNS_TTL:
+        return hit[1]
+    ok = True
+    try:
+        infos = await asyncio.wait_for(
+            asyncio.get_running_loop().getaddrinfo(host, None), timeout=1.5)
+    except Exception:  # noqa: BLE001
+        infos = None                      # cannot resolve -> let the request fail on its own
+    if infos:
+        for info in infos:
+            try:
+                if not _ip_is_public(ipaddress.ip_address(info[4][0])):
+                    ok = False
+                    break
+            except ValueError:
+                continue
+    _DNS_OK[host] = (time.monotonic(), ok)
+    return ok
+
+
+class _Fetched:
+    """A small response wrapper: status, headers and a BOUNDED body."""
+    __slots__ = ("status_code", "headers", "content")
+
+    def __init__(self, status_code: int, headers: dict, content: bytes):
+        self.status_code = status_code
+        self.headers = headers
+        self.content = content
+
+    @property
+    def text(self) -> str:
+        return self.content.decode("utf-8", "ignore")
+
+    def json(self):
+        return json.loads(self.text)
+
+
 async def _fetch(url: str, *, headers=None, params=None, timeout: float = 12, attempts: int = 3,
                  deadline: float = 22, retry_blocked: bool = False):
-    """GET with pacing, backoff, jitter and a per-host breaker. Returns a Response, or None."""
-    if not url or not url.startswith("http"):
+    """GET with an SSRF guard, a body-size cap, pacing, backoff, jitter and a host breaker.
+
+    Returns a _Fetched (bounded body), or None. Redirects are followed MANUALLY (max 3) and
+    every hop is re-validated, because an allowed URL can redirect to a private address.
+    """
+    if not _url_is_public(url):
+        log.debug("fetch: refused a non-public URL %s", (url or "")[:60])
         return None
     host = (urllib.parse.urlparse(url).hostname or "").lower()
-    if not host or not _breaker_allows(host):
+    if not _breaker_allows(host) or not await _host_is_public(host):
         log.debug("fetch: skipped %s", host or url[:40])
         return None
     started = time.monotonic()
-    hdrs = _browser_headers(url, headers)
-    for attempt in range(max(1, attempts)):
-        if time.monotonic() - started > deadline:
-            break
-        await _host_wait(host)
-        try:
-            r = await HTTP.get(url, headers=hdrs, params=params, timeout=timeout)
-        except Exception as e:  # noqa: BLE001
-            _breaker_record(host, False)
-            if attempt + 1 < attempts:
-                await asyncio.sleep(min(4.0, 0.5 * (2 ** attempt)) * (0.5 + random.random()))
+    cur, redirects, first = url, 0, True
+    while True:
+        for attempt in range(max(1, attempts)):
+            if time.monotonic() - started > deadline:
+                return None
+            hdrs = _browser_headers(cur, headers)
+            await _host_wait((urllib.parse.urlparse(cur).hostname or "").lower())
+            status, rheaders, body = 0, {}, b""
+            try:
+                if hasattr(HTTP, "stream"):        # real client: stream, so the cap is real
+                    async with HTTP.stream("GET", cur, headers=hdrs,
+                                           params=params if first else None,
+                                           timeout=timeout, follow_redirects=False) as resp:
+                        status = resp.status_code
+                        rheaders = {k.lower(): v for k, v in (getattr(resp, "headers", {}) or {}).items()}
+                        if status < 400 and status not in (301, 302, 303, 307, 308):
+                            total, chunks = 0, []
+                            async for chunk in resp.aiter_bytes():
+                                total += len(chunk)
+                                if total > MAX_FETCH_BYTES:
+                                    log.warning("fetch: body cap hit for %s (%s+ bytes)",
+                                                host, total)
+                                    break
+                                chunks.append(chunk)
+                            body = b"".join(chunks)
+                else:                               # test double without .stream
+                    resp = await HTTP.get(cur, headers=hdrs,
+                                          params=params if first else None,
+                                          timeout=timeout, follow_redirects=False)
+                    status = resp.status_code
+                    rheaders = {k.lower(): v for k, v in (getattr(resp, "headers", {}) or {}).items()}
+                    body = (getattr(resp, "text", "") or "").encode("utf-8", "ignore")[:MAX_FETCH_BYTES]
+            except Exception as e:  # noqa: BLE001
+                _breaker_record(host, False)
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(min(4.0, 0.5 * (2 ** attempt)) * (0.5 + random.random()))
+                    continue
+                log.debug("fetch failed (%s): %s", host, str(e)[:80])
+                return None
+            if status in (301, 302, 303, 307, 308):
+                loc = rheaders.get("location") or ""
+                nxt = urllib.parse.urljoin(cur, loc) if loc else ""
+                if not nxt or redirects >= MAX_REDIRECTS or not _url_is_public(nxt):
+                    log.debug("fetch: refusing redirect %s", (loc or "")[:60])
+                    _breaker_record(host, False)
+                    return None
+                nh = (urllib.parse.urlparse(nxt).hostname or "").lower()
+                if not await _host_is_public(nh):
+                    log.debug("fetch: redirect to a private host refused (%s)", nh)
+                    _breaker_record(host, False)
+                    return None
+                cur, redirects, first = nxt, redirects + 1, False
+                break                      # leave the attempt loop, follow the hop
+            if status in _RETRY_STATUS and attempt + 1 < attempts:
+                _breaker_record(host, False)
+                await asyncio.sleep(_backoff(_Fetched(status, rheaders, b""), attempt))
                 continue
-            log.debug("fetch failed (%s): %s", host, str(e)[:80])
-            return None
-        if r.status_code in _RETRY_STATUS and attempt + 1 < attempts:
+            if status in _PERMANENT_STATUS and not (retry_blocked and attempt == 0):
+                _breaker_record(host, False)
+                log.debug("fetch: permanent %s from %s", status, host)
+                return None
+            if status >= 400:
+                _breaker_record(host, False)
+                return None
+            _breaker_record(host, True)
+            return _Fetched(status, rheaders, body)
+        else:
             _breaker_record(host, False)
-            await asyncio.sleep(_backoff(r, attempt))
-            continue
-        if r.status_code in _PERMANENT_STATUS and not (retry_blocked and attempt == 0):
-            _breaker_record(host, False)
-            log.debug("fetch: permanent %s from %s", r.status_code, host)
             return None
-        if r.status_code >= 400:
-            _breaker_record(host, False)
-            return None
-        _breaker_record(host, True)
-        return r
-    _breaker_record(host, False)
-    return None
 
 
 def _og_meta(h: str) -> str:
@@ -5241,7 +5417,7 @@ async def _proactive_loop(bot) -> None:
 async def _post_init(app) -> None:
     # Clear any stale webhook so long polling never conflicts with one.
     try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
+        await app.bot.delete_webhook(drop_pending_updates=DROP_PENDING_UPDATES)
         log.info("Webhook cleared; using long polling.")
     except Exception as e:  # noqa: BLE001
         log.warning("delete_webhook failed (ignored): %s", e)
@@ -5897,7 +6073,7 @@ def main() -> None:
     while True:
         try:
             _build_app().run_polling(allowed_updates=Update.ALL_TYPES,
-                                     drop_pending_updates=True)
+                                     drop_pending_updates=DROP_PENDING_UPDATES)
             break
         except Conflict as e:
             log.error("CONFLICT: another bot instance is polling with this token (a duplicate "

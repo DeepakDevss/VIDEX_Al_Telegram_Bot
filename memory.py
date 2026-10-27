@@ -64,7 +64,6 @@ def load() -> None:
     global _LOADED
     if _LOADED:
         return
-    _LOADED = True
     path = MEMORY_FILE
     # One-time migration: if the new file is missing but the pre-rename one exists, read that
     # instead so a rename never looks like "all memory vanished".
@@ -81,14 +80,23 @@ def load() -> None:
             _DATA["seq"] = int(raw.get("seq", 0) or 0)
         if path == _OLD_MEMORY_FILE:
             save(force=True)          # write it out under the new name right away
+        _LOADED = True                # ONLY after a successful load
     except FileNotFoundError:
-        pass
+        _LOADED = True                # no file yet = a brand new store, not a failure
     except json.JSONDecodeError as e:
         # A corrupt file used to vanish silently - the user just lost all memory with no
-        # clue why. Say so loudly, then carry on with an empty store.
-        _log.error("memory file is corrupt (%s) - starting fresh: %s", MEMORY_FILE, e)
+        # clue why. Keep the evidence, then carry on with an empty store.
+        try:
+            bad = MEMORY_FILE + ".corrupt"
+            os.replace(path, bad)
+            _log.error("memory file is corrupt (%s) - quarantined to %s", e, bad)
+        except Exception:  # noqa: BLE001
+            _log.error("memory file is corrupt (%s) - starting fresh", e)
+        _LOADED = True
     except Exception as e:  # noqa: BLE001
-        _log.error("memory load failed (%s) - starting fresh: %s", MEMORY_FILE, e)
+        # A transient read error must NOT poison the process for its whole lifetime - leave
+        # _LOADED False so the next call retries instead of running on an empty store.
+        _log.error("memory load failed (%s) - will retry on the next call: %s", MEMORY_FILE, e)
 
 
 _DIRTY = False
@@ -295,6 +303,36 @@ def set_profile(user_id, text) -> bool:
     return True
 
 
+def drop_notes(user_id, notes) -> int:
+    """Remove ONLY the given notes (a compaction snapshot), leaving later ones intact.
+
+    clear_notes() wiped everything, so a fact added while the compaction model call was in
+    flight was silently lost.
+    """
+    load()
+    uid = str(user_id)
+    drop = {}
+    for n in (notes or []):
+        drop[n] = drop.get(n, 0) + 1
+    removed = 0
+    with _LOCK:
+        u = _DATA["users"].get(uid)
+        if u is None:
+            return 0
+        keep = []
+        for x in (u.get("likes") or []):
+            k = drop.get(x, 0)
+            if k:
+                drop[x] = k - 1
+                removed += 1
+            else:
+                keep.append(x)
+        u["likes"] = keep
+    if removed:
+        save()
+    return removed
+
+
 def clear_notes(user_id) -> int:
     """Drop the raw notes once they have been folded into the profile. Returns how many."""
     load()
@@ -499,9 +537,19 @@ def stats() -> dict:
 
 
 def forget(user_id) -> bool:
+    """Erase EVERY user-keyed record: profile, notes AND their reminders.
+
+    Deleting only _DATA['users'] used to leave reminder rows (user id + text) behind, so
+    /forget claimed a complete deletion that was not complete.
+    """
     load()
+    uid = str(user_id)
     with _LOCK:
-        gone = _DATA["users"].pop(str(user_id), None) is not None
+        gone = _DATA["users"].pop(uid, None) is not None
+        rem = _DATA.get("reminders") or {}
+        for k in [k for k, r in rem.items() if str(r.get("uid")) == uid]:
+            rem.pop(k, None)
+            gone = True
     if gone:
         save(force=True)
     return gone

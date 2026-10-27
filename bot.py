@@ -703,6 +703,12 @@ SYSTEM_PROMPT = (
     f"{RESEARCH_MAX_ROUNDS} times in one reply if you need to refine the query.\n"
     "   Do NOT search for: general knowledge, definitions, opinions, advice, coding help, "
     "maths, translations, or things you already know well.\n"
+    "   ALWAYS search - no exceptions - when the question contains 'top', 'best', 'sabse', "
+    "'latest', 'current', 'abhi', 'aaj', 'kab', 'kaun', 'konsa', or asks for a DATE, a "
+    "FESTIVAL/holiday date, a RANKING, a price, or 'which model/version is best'. Your "
+    "training data is OLD for all of these: naming a product, model or version from memory "
+    "when a newer one exists is a serious error. If you are not sure it is still the newest, "
+    "search first, then answer with what the live data says.\n"
     "2. [file: name.md] on its own line, then the content, then [/file] on its own line - "
     "writes the content out as a real downloadable file. Use it only when you produced "
     "something long or structured they will want to KEEP or reuse: notes, a plan, a "
@@ -2173,6 +2179,28 @@ _LIVE_HINT_RE = re.compile(
     r"stock|share|nifty|sensex|crypto|bitcoin|dollar|rupee|exchange|"
     r"who\s+is\s+the\s+(current|new)|kaun\s+hai\s+(abhi|aaj)|"
     r"release|launch|kab\s+(aa|aayega|aayegi|release))\b", re.I)
+# A question shape + a freshness noun = "could this have changed since training?".
+# The old single regex missed the two most common real questions:
+#   "diwali kab hai?"      (a date)      and   "top model konsa hai?"  (a ranking)
+# so the model answered those from stale training data. This catches both.
+_QUESTION_RE = re.compile(
+    r"\?|\b(kya|kaun|kab|konsa|kaunsa|kitna|kitne|kab\s+hai|batao|bata\s*do|hai|hain|hoga|hogi)\b",
+    re.I)
+_FRESH_Q_RE = re.compile(
+    r"\b(top|best|sabse|behtar|latest|newest|current|abhi|aaj|kab|kaun|konsa|kaunsa|"
+    r"winner|champion|ranking|rank|model|version|release|update|tyohar|festival|holiday|"
+    r"chutti|tarikh|election|result|score|price|rate|news|khabar|launch|announce)\b", re.I)
+
+
+def _needs_live(text: str) -> bool:
+    """True when the answer could have changed since training (price, date, ranking, who)."""
+    if not text:
+        return False
+    if _LIVE_HINT_RE.search(text):
+        return True
+    return bool(_FRESH_Q_RE.search(text) and _QUESTION_RE.search(text))
+
+
 # The model's classic excuse - if we see it, we fetch and ask again rather than shipping it.
 _NO_ACCESS_RE = re.compile(
     r"real[- ]?time\s+(data|access|info|market)|live\s+(data|access)|"
@@ -3574,6 +3602,30 @@ def _short_summary(media, state, text, forward):
     return " ".join(bits).strip()
 
 
+async def _live_fallback(text: str, chat_id: int, pre: str = "") -> str:
+    """Answer from the LIVE SOURCES themselves when no model is available.
+
+    A factual question must never be answered with "I am busy" - the search layer is
+    independent of the model, so it can still produce something true and sourced.
+    If pre-flight research already fetched data this turn, REUSE it: calling the search
+    again would be blocked by its own cooldown and would waste a lookup.
+    """
+    live = pre or ""
+    if not live:
+        if not (RESEARCH_ENABLED and text and action_allowed(chat_id, "search")):
+            return ""
+        try:
+            live = await free_web_search(text[:160], RESEARCH_RESULTS)
+        except Exception as e:  # noqa: BLE001
+            log.debug("live fallback search failed: %s", str(e)[:80])
+            return ""
+    if not live:
+        return ""
+    log.info("model unavailable - answering chat %s from live sources", chat_id)
+    return ("Live sources se abhi ye mila:\n\n" + live[:2500] +
+            "\n\n_(AI ka jawab abhi nahi ban paya, ye seedha live sources se hai.)_")
+
+
 async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None,
                   force_voice: bool = False, pre_image=None) -> None:
     chat_id = u.effective_chat.id
@@ -3694,7 +3746,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             # something that changes, fetch it FIRST so the answer has real figures.
             pre_research = ""
             if (RESEARCH_ENABLED and not media and text and len(text) > 4
-                    and _LIVE_HINT_RE.search(text) and action_allowed(chat_id, "search")):
+                    and _needs_live(text) and action_allowed(chat_id, "search")):
                 pre_research = await free_web_search(text[:160], RESEARCH_RESULTS)
                 if pre_research:
                     ctx += ("\n\n" + pre_research +
@@ -3847,7 +3899,15 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 log.warning("prompt-leak attempt blocked for chat %s", chat_id)
                 ans = ("Ye meri internal baat hai, iske baare me main nahi bata sakta. "
                        "Aur kuch poochho - madad karta hoon.")
-            clean = clean_reply(ans)
+            if (ans or "").strip() == BUSY_MSG:
+                # Every model (Gemini -> Groq -> Pollinations) is unavailable. A factual
+                # question should still be answered, so use the live sources directly
+                # instead of shipping "I am busy" to someone who asked a real question.
+                clean = (await _live_fallback(text, chat_id, pre_research) or
+                         "Abhi jawab nahi ban paya (model busy hai, aur live sources se bhi "
+                         "kuch nahi mila). Thodi der baad dobara bhejo.")
+            else:
+                clean = clean_reply(ans)
             if not clean:
                 # The reply carried NO visible text: the model returned only internal tags
                 # (usually a lone "[react:..]") or nothing at all. NEVER send a bare emoji or a
@@ -3868,8 +3928,11 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                     log.warning("empty-reply retry failed: %s", str(e)[:120])
                 clean = clean_reply(retry) if (retry and retry != BUSY_MSG) else ""
                 if not clean:
-                    clean = ("Sorry, jawab banate waqt kuch technical dikkat aa gayi. "
-                             "Ek baar dobara bhejo.")
+                    # The model returned nothing twice - answer from the live sources rather
+                    # than a useless "technical error".
+                    clean = (await _live_fallback(text, chat_id, pre_research) or
+                             "Abhi jawab nahi ban paya (model busy hai). "
+                             "Thodi der baad dobara bhejo.")
             # ---- NATURAL-LANGUAGE FILE FALLBACK ---------------------------------
             # The model did not emit [file:], but the person clearly asked for a file in plain
             # words (no command). If the answer is substantial, attach it as a real download.

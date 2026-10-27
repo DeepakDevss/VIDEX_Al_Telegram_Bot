@@ -9,7 +9,7 @@ here is aspirational.
 ## 1. Who we are
 
 VIDEX is a personal/community AI assistant that runs as a Telegram bot at **@Linnet_Agents_Bot**.
-The developer is Deepak Danodiya (https://github.com/DeepakDevss). Contact:
+The developer is Deepak Danodia (https://github.com/DeepakDevss). Contact:
 **coresovereign.official@gmail.com**.
 
 VIDEX is not affiliated with, endorsed by, or operated by Telegram.

@@ -174,7 +174,7 @@ Issues and pull requests are welcome.
 
 ## Author
 
-Deepak Devs
+Deepak Danodia
 
 - GitHub: https://github.com/DeepakDevss
 - X: https://x.com/Deepak_Devs

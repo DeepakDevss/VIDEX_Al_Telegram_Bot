@@ -2846,6 +2846,8 @@ HELP = ("❓ *Help / Commands*\n\n/start - restart the bot\n/help - this help\n"
         "/remind 30m <kaam> - set a reminder (also: 'remind me in 2h to call mom')\n"
         "/reminders - list your reminders\n/delremind <id> - delete one\n"
         "/privacy - how your data is handled\n/feed <rss-url> - read an RSS/Atom feed\n"
+        "/papers <topic> - search arXiv papers\n/define <word> - dictionary meaning\n"
+        "/holiday [IN] - public holidays\n"
         "/research <query> - look something up on the live web\n\n"
         "💡 Send text, a photo, a voice note, a PDF or a YouTube link - the AI replies in "
         "your language.")
@@ -2881,6 +2883,9 @@ PUBLIC_COMMANDS = [
     ("delremind", "Delete a reminder by its id"),
     ("privacy", "How your data is handled"),
     ("feed", "Read an RSS/Atom feed: /feed <url>"),
+    ("papers", "Search arXiv papers"),
+    ("define", "Dictionary: /define <word>"),
+    ("holiday", "Public holidays: /holiday [country]"),
 ]
 OWNER_COMMANDS = [
     ("diag", "Diagnostics + live self-test"),
@@ -4738,6 +4743,66 @@ async def _erapi_quote(base: str = "USD", quote: str = "INR"):
         return None
 
 
+# ---- CDN rate table (the most block-proof source we have) --------------------------------
+# One JSON on jsDelivr carries FX + crypto + metals (339 assets, USD base). A CDN is served
+# from many edges and is not rate-limited like an API host, so it still answers on networks
+# that block every finance API. Verified live: inr, eur, gbp, btc, eth, xau, xag, sol, doge.
+_CDN_RATES_URL = ("https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/"
+                  "currencies/usd.json")
+_CDN_TTL = float(os.environ.get("CDN_RATES_TTL", "600") or "600")
+_CDN_CACHE = {"t": 0.0, "d": {}}
+
+
+async def _cdn_rates() -> dict:
+    """USD -> {code: rate} from the CDN table, cached for a few minutes."""
+    if _CDN_CACHE["d"] and (time.time() - _CDN_CACHE["t"]) < _CDN_TTL:
+        return _CDN_CACHE["d"]
+    r = await _fetch(_CDN_RATES_URL, timeout=10, headers={"Accept": "application/json"})
+    if r is None:
+        return _CDN_CACHE["d"] or {}
+    try:
+        d = (r.json() or {}).get("usd") or {}
+    except Exception:  # noqa: BLE001
+        d = {}
+    if d:
+        _CDN_CACHE.update({"t": time.time(), "d": d})
+    return d
+
+
+async def _cdn_metal_quote(metal: str):
+    """Gold/silver spot from the CDN table (stored as units-of-metal per 1 USD)."""
+    v = (await _cdn_rates()).get(metal.lower())
+    if not v:
+        return None
+    try:
+        return {"symbol": metal, "name": metal, "price": 1.0 / float(v),
+                "currency": "USD", "prev": None}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _cdn_crypto_quote(code: str):
+    v = (await _cdn_rates()).get((code or "").lower())
+    if not v:
+        return None
+    try:
+        return {"symbol": code.upper(), "name": code.upper(), "price": 1.0 / float(v),
+                "currency": "USD", "prev": None}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _cdn_fx_quote(code: str = "inr"):
+    v = (await _cdn_rates()).get((code or "").lower())
+    if not v:
+        return None
+    try:
+        return {"symbol": "USD" + code.upper(), "name": "USD/" + code.upper(),
+                "price": float(v), "currency": code.upper(), "prev": None}
+    except Exception:  # noqa: BLE001
+        return None
+
+
 async def _binance_quote(pair: str):
     """Keyless 24h crypto quote from Binance's public API (no key, generous limits)."""
     try:
@@ -4764,7 +4829,7 @@ async def _quote(symbol: str):
         if q and q.get("price"):
             return q
     if symbol == "USDINR=X":
-        return await _erapi_quote("USD", "INR")
+        return await _erapi_quote("USD", "INR") or await _cdn_fx_quote("inr")
     return None
 
 
@@ -4794,7 +4859,10 @@ async def _finance_lookup(query: str) -> str:
                     break
         if not quote and inst in ("gold", "silver"):
             metal = "XAU" if inst == "gold" else "XAG"
-            quote = await _goldapi_quote(metal) or await _goldprice_quote(metal)
+            quote = (await _goldapi_quote(metal) or await _goldprice_quote(metal)
+                     or await _cdn_metal_quote(metal))
+        if not quote and inst in ("bitcoin", "ethereum"):
+            quote = await _cdn_crypto_quote("btc" if inst == "bitcoin" else "eth")
         if not quote:
             continue
         p = quote["price"]
@@ -5374,6 +5442,103 @@ async def cmd_voicelist(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     await u.message.reply_text(body[:3800])
 
 
+# ---- arXiv papers ----------------------------------------------------------------------
+async def _arxiv_search(query: str, n: int = 5) -> str:
+    """Search arXiv (keyless Atom API) and return the top papers."""
+    if not query:
+        return ""
+    r = await _fetch("http://export.arxiv.org/api/query",
+                     params={"search_query": "all:" + query, "max_results": n,
+                             "sortBy": "relevance"},
+                     timeout=18, headers={"Accept": "application/atom+xml"})
+    if r is None:
+        return ""
+    xml = r.text or ""
+    out = []
+    for b in re.findall(r"(?is)<entry>(.*?)</entry>", xml)[:n]:
+        t = re.search(r"(?is)<title[^>]*>(.*?)</title>", b)
+        title = re.sub(r"\s+", " ", html.unescape(t.group(1))).strip() if t else ""
+        i = re.search(r"(?is)<id>(.*?)</id>", b)
+        link = (i.group(1).strip() if i else "")
+        p = re.search(r"(?is)<published>(.*?)</published>", b)
+        when = (p.group(1) or "")[:10] if p else ""
+        s = re.search(r"(?is)<summary>(.*?)</summary>", b)
+        summ = re.sub(r"\s+", " ", html.unescape(s.group(1))).strip()[:220] if s else ""
+        if title:
+            out.append(f"- {title}" + (f" ({when})" if when else "") +
+                       (f"\n  {link}" if link else "") + (f"\n  {summ}" if summ else ""))
+    if not out:
+        return ""
+    return "=== ARXIV PAPERS ===\n" + "\n".join(out)
+
+
+async def cmd_papers(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """Search arXiv papers: /papers <query>"""
+    chat_id = u.effective_chat.id
+    q = " ".join(c.args or []).strip()
+    if not q:
+        await _send_plain(c.bot, chat_id, "Format: /papers <topic>\nExample: /papers transformer memory")
+        return
+    res = await _arxiv_search(q, 5)
+    if not res:
+        await _send_plain(c.bot, chat_id, "Us topic pe koi paper nahi mila. Doosre words try karo.")
+        return
+    for chunk in split_text(res, 3500):
+        await _send_plain(c.bot, chat_id, chunk)
+
+
+async def cmd_define(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """Dictionary lookup: /define <word>"""
+    chat_id = u.effective_chat.id
+    w = " ".join(c.args or []).strip()
+    if not w:
+        await _send_plain(c.bot, chat_id, "Format: /define <word>")
+        return
+    r = await _fetch("https://api.dictionaryapi.dev/api/v2/entries/en/" +
+                     urllib.parse.quote(w[:40]), timeout=10,
+                     headers={"Accept": "application/json"})
+    body = ""
+    if r is not None:
+        try:
+            data = r.json() or []
+            lines = [f"📖 {w}"]
+            for entry in data[:2]:
+                for m in (entry.get("meanings") or [])[:3]:
+                    for d in (m.get("definitions") or [])[:2]:
+                        lines.append(f"• ({m.get('partOfSpeech','')}) {d.get('definition','')[:220]}")
+            if len(lines) > 1:
+                body = "\n".join(lines)
+        except Exception as e:  # noqa: BLE001
+            log.debug("define parse failed: %s", str(e)[:80])
+    if not body:
+        await _send_plain(c.bot, chat_id, "Us word ka meaning nahi mila (ya service down hai).")
+        return
+    for chunk in split_text(body, 3500):
+        await _send_plain(c.bot, chat_id, chunk)
+
+
+async def cmd_holiday(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """Public holidays: /holiday [country] (default IN)"""
+    chat_id = u.effective_chat.id
+    cc = ((c.args or ["IN"])[0] or "IN").upper()[:2]
+    year = time.strftime("%Y")
+    r = await _fetch(f"https://date.nager.at/api/v3/PublicHolidays/{year}/{cc}",
+                     timeout=10, headers={"Accept": "application/json"})
+    out = []
+    if r is not None:
+        try:
+            for h in (r.json() or [])[:20]:
+                out.append(f"- {h.get('date','')}  {h.get('localName') or h.get('name','')}")
+        except Exception as e:  # noqa: BLE001
+            log.debug("holiday parse failed: %s", str(e)[:80])
+    if not out:
+        await _send_plain(c.bot, chat_id,
+                          f"{cc} ke holidays nahi mile (ya service down hai).")
+        return
+    for chunk in split_text(f"🎉 Public holidays {year} ({cc})\n" + "\n".join(out), 3500):
+        await _send_plain(c.bot, chat_id, chunk)
+
+
 async def cmd_feed(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     """Read any RSS/Atom feed: /feed https://example.com/feed"""
     chat_id = u.effective_chat.id
@@ -5651,6 +5816,9 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("delremind", cmd_delremind))
     app.add_handler(CommandHandler("privacy", cmd_privacy))
     app.add_handler(CommandHandler("feed", cmd_feed))
+    app.add_handler(CommandHandler("papers", cmd_papers))
+    app.add_handler(CommandHandler("define", cmd_define))
+    app.add_handler(CommandHandler("holiday", cmd_holiday))
     app.add_handler(CommandHandler("ai", cmd_ai))
     app.add_handler(CommandHandler("research", cmd_research))
     app.add_handler(CommandHandler("welcome", cmd_welcome))

@@ -27,6 +27,8 @@ The bot is meant to run as a long-lived service. It should work on any platform 
 - YouTube links too: title, channel, description and public captions — no browser, no key
 - Fetches politely and resiliently: per-host pacing, backoff + jitter on transient errors, and a per-host circuit breaker, so a site never blocks the bot
 - Reads RSS/Atom feeds — send a feed URL, or `/feed <url>`, and get its latest items
+- `/papers` (arXiv), `/define` (dictionary), `/holiday` (public holidays) — all keyless
+- Prices come from several sources including a jsDelivr CDN rate table (FX + crypto + gold/silver in one file), so they keep working even when finance APIs are blocked
 - Looks things up live (prices, weather, news) with no API key — gold, silver, USD/INR, and crypto (Binance), each with several fallback sources
 - Remembers the links you share, so you can ask about them later
 - Does exact arithmetic on request

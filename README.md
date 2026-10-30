@@ -3,7 +3,7 @@
 A Telegram AI bot written in Python. It holds conversations, understands media, remembers users across sessions, and can reply with text or voice.
 
 - Bot: https://t.me/AvenorAlBot
-- Repository: https://github.com/bydenvik/VIDEX_Al_Telegram_Bot
+- Repository: https://github.com/bydenvik/avenor-ai-telegram-bot
 - Developer: https://github.com/bydenvik
 
 ---
@@ -181,8 +181,8 @@ Issues and pull requests are welcome.
 Deepak Danodia
 
 - GitHub: https://github.com/bydenvik
-- X: https://x.com/Deepak_Devs
-- Reddit: https://www.reddit.com/u/Deepak_Devs
+- X: https://x.com/bydenvik
+- Reddit: https://www.reddit.com/u/bydenvik
 
 ---
 

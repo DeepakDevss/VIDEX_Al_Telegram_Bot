@@ -52,8 +52,8 @@ The bot is meant to run as a long-lived service. It should work on any platform 
 Clone the repo and install the dependencies:
 
 ```bash
-git clone https://github.com/bydenvik/VIDEX_Al_Telegram_Bot.git
-cd VIDEX_Al_Telegram_Bot
+git clone https://github.com/bydenvik/avenor-ai-telegram-bot.git
+cd avenor-ai-telegram-bot
 
 python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
@@ -99,7 +99,7 @@ Command handlers are registered in `bot.py`. Check that file for the full list o
 ## Project structure
 
 ```
-VIDEX_Al_Telegram_Bot/
+avenor-ai-telegram-bot/
 ├── bot.py              Main application logic (kept as one file on purpose)
 ├── memory.py           Persistent JSON store for users and chats
 ├── requirements.txt    Python dependencies
@@ -145,6 +145,36 @@ Memory is kept per user, keyed by their Telegram ID, and only ever injected into
 - **Media download fails** — the message is still answered, with the attachment noted as unavailable.
 - **TTS fails** — the text reply is already sent, so the answer is not lost.
 - **Memory unavailable** — the bot still runs; it just has no long-term recall (see Memory above).
+- **Reminder delivery fails** — the reminder is retried with exponential backoff (5 attempts,
+  up to 30 minutes apart) and only deleted after it is actually delivered; if every attempt
+  fails the user gets an explicit "could not be delivered" message instead of silence.
+
+---
+
+## Known limitations
+
+These are known and accepted, not oversights. Each one is here so a future maintainer does
+not rediscover it the hard way.
+
+- **DNS rebinding window.** Every outbound fetch validates the URL structurally, resolves the
+  host and rejects any private/loopback/link-local answer, and re-validates every redirect hop.
+  The HTTP client then resolves the name again, so a hostile DNS server with a very short TTL
+  could in principle answer public for our check and private for the connection. Pinning the
+  connection to the validated IP was considered and rejected: it bypasses the egress proxy that
+  many hosts (and most corporate networks) require, which would break every fetch. The impact
+  is limited because the bot reaches no internal services.
+- **Single-instance only.** State lives in one JSON file, so two polling processes would
+  overwrite each other and Telegram would return `Conflict`. One instance per token.
+- **The JSON store does not scale indefinitely.** It is rewritten as a whole file, which is
+  fine for a community bot and wrong for thousands of very active chats. The migration path is
+  SQLite; the accessor functions in `memory.py` are the seam to swap.
+- **Model-emitted action tags are trusted.** `[remember:]`, `[remind:]` and `[file:]` in the
+  model's own output trigger real actions. User text cannot inject them (they are stripped from
+  the transcript, and stored memory is sanitised on read), but a page the model *reads* could in
+  theory steer one. Every action is rate-limited per chat, and the stored text is sanitised.
+- **`bot.py` is one large file on purpose** (see Contributing). It is reviewed and tested as a
+  unit; splitting it would need the shared prompt, model chain and delivery path to become
+  explicit interfaces first.
 
 ---
 

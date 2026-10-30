@@ -283,6 +283,25 @@ BUSY_MSG = ("🌸 Avenor is a little busy right now. "
             "Please try again in a minute or two.")
 
 
+def _lang_for(u) -> str:
+    """The language to answer a COMMAND in: this chat's recent language, else the user's
+    stored language, else English. Commands carry no prose of their own to detect from."""
+    chat = getattr(u, "effective_chat", None)
+    if chat is not None:
+        lang = CHAT_LANG.get(chat.id)
+        if lang in ("english", "hindi", "hinglish"):
+            return lang
+    user = getattr(u, "effective_user", None)
+    if user is not None and MEM is not None:
+        try:
+            stored = (MEM.get_user(user.id) or {}).get("language")
+            if stored in ("english", "hindi", "hinglish"):
+                return stored
+        except Exception:  # noqa: BLE001
+            pass
+    return "english"
+
+
 def _msg(lang: str, en: str, hi: str, hinglish: str) -> str:
     """Pick the user-facing line that matches the language of THIS conversation.
 
@@ -1062,14 +1081,21 @@ def _sanitize_input(text: str, limit: int = 6000) -> str:
     return t.strip()[:limit]
 
 
-def log_line(chat_id: int, who: str, text: str) -> None:
+def log_line(chat_id: int, who: str, text: str, uid: int = 0) -> None:
+    """Append one line to the chat transcript, keyed by the SPEAKER'S USER ID.
+
+    The id is stored alongside the display name because a display name is not an identity:
+    two members can both be "Rahul", and anyone can rename themselves to match someone
+    else. /forget used to filter this transcript by NAME, so it could erase a different
+    person's lines (and a name-copying attacker could wipe someone else's context).
+    """
     text = _sanitize_input(text)
     text = re.sub(r"\s+", " ", text.strip())
     text = _strip_unclosed_tags(_TAG_INJECT_RE.sub("", text))
     text = _FAKE_NAME_RE.sub("", text)
     text = text[:LOG_LINE_CHARS]
     if text:
-        CHAT_LOG[chat_id].append((who, text))
+        CHAT_LOG[chat_id].append((int(uid or 0), who, text))
         _CHAT_SEEN[chat_id] = time.time()
 
 
@@ -1078,7 +1104,7 @@ def recent_chat_block(chat_id: int, speaker: str) -> str:
     re-sent to the model on every single reply, so an unbounded one makes replies slow."""
     items = list(CHAT_LOG.get(chat_id, []))
     budget, picked = RECENT_CHAT_CHARS, []
-    for who, txt in reversed(items):            # newest first; keep whatever fits
+    for _uid, who, txt in reversed(items):      # newest first; keep whatever fits
         line = f"{who}: {txt}"
         budget -= len(line) + 1
         if budget < 0 and picked:
@@ -1521,6 +1547,11 @@ async def fetch_bytes(c, file_id, limit):
             log.warning("file too big: %s bytes", f.file_size)
             return None
         data = bytes(await f.download_as_bytearray())
+        # file_size is METADATA: Telegram sometimes omits it, and the check above then does
+        # nothing at all. Enforce the same cap on what actually arrived.
+        if len(data) > limit:
+            log.warning("download exceeded the cap: %s bytes (limit %s)", len(data), limit)
+            return None
         return data or None
     except Exception as e:  # noqa: BLE001
         log.warning("download failed: %s", e)
@@ -2981,6 +3012,7 @@ async def ask_gemini_stream(chat_id, prompt_text: str, context: str,
 
 # ============================ PART 14: HEALTH SERVER (Render) ============================
 _HEALTH_SRV = None
+_READY = False          # flipped in _post_init once the bot can actually serve updates
 
 
 def start_health_server() -> None:
@@ -2994,20 +3026,27 @@ def start_health_server() -> None:
     # free instance is exactly the 50-second delay on the first message. So: plain text,
     # 2 bytes, on every path, with an explicit Content-Length.
     _OK = b"ok"
+    _STARTING = b"starting"
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"
 
-        def _send(self, body: bool):
-            self.send_response(200)
+        def _send(self, body: bool, code: int = 200, payload: bytes = _OK):
+            self.send_response(code)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(_OK)))
+            self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             if body:
-                self.wfile.write(_OK)
+                self.wfile.write(payload)
 
         def do_GET(self):
+            # /health is LIVENESS ("is the process up") - the keep-alive pinger needs it to
+            # stay cheap and always 200. /ready is READINESS ("can it actually serve"), which
+            # is false until polling, memory and the command menu are set up.
+            if self.path.rstrip("/") == "/ready" and not _READY:
+                self._send(True, 503, _STARTING)
+                return
             self._send(True)
 
         def do_HEAD(self):
@@ -3228,11 +3267,27 @@ async def cmd_logo(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_memory(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     """Owner sees everything we remember; a normal user sees only their own basics
-    (name, ID, and the day they joined)."""
+    (name, ID, and the day they joined).
+
+    PRIVATE CHAT ONLY. This prints personal notes, and the owner view prints the whole user
+    table (names, @usernames, message counts, notes, chat ids). Replying into the chat the
+    command was typed in meant that typing /memory in a group published one member's - or
+    the owner's entire database of - personal data to everyone in the group.
+    """
     chat_id = u.effective_chat.id
     user = u.effective_user
     if MEM is None:
         await _send_plain(c.bot, chat_id, "Long-term memory is not available right now.")
+        return
+    if getattr(u.effective_chat, "type", "private") != "private":
+        await _send_plain(c.bot, chat_id, _msg(
+            _lang_for(u),
+            en="For privacy, /memory only works in a private chat with me - open a direct "
+               "message and send /memory there.",
+            hi="/memory निजी बातचीत में ही चलता है - मुझे सीधे message कीजिए और वहाँ "
+               "/memory भेजिए.",
+            hinglish="/memory sirf private chat mein chalta hai - mujhe direct message "
+                     "karke wahan /memory bhejo."))
         return
     if not is_owner(user):
         # A normal user sees ONLY their own memory - never anyone else's.
@@ -3459,9 +3514,11 @@ async def cmd_forget(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         _q = CHAT_LOG.get(_cid)
         if _q:
-            _me = (u.effective_user.full_name or "").strip().lower()
-            CHAT_LOG[_cid] = deque((w, t) for (w, t) in _q
-                                   if (w or "").strip().lower() != _me)
+            # Match on the STABLE user id, never the display name. Filtering by name meant
+            # a same-named member lost their transcript too, and a user could rename
+            # themselves to someone else's name and erase that person's lines.
+            _me_uid = u.effective_user.id
+            CHAT_LOG[_cid] = deque((i, w, t) for (i, w, t) in _q if i != _me_uid)
     # The members roster is a second user-keyed store - erase the person there too.
     try:
         _removed = False
@@ -3746,6 +3803,9 @@ async def fetch_profile_photo(bot, user_id):
         best = max(photos.photos[0], key=lambda s: (s.width or 0) * (s.height or 0))
         f = await bot.get_file(best.file_id)
         data = bytes(await f.download_as_bytearray())
+        if len(data) > MAX_IMAGE_BYTES:
+            log.warning("profile photo too large: %s bytes", len(data))
+            return None
         return data or None
     except Exception as e:  # noqa: BLE001
         log.warning("profile photo fetch failed for %s: %s", user_id, e)
@@ -3976,7 +4036,8 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                         else "Please look at this and tell me about it.")
 
             # Remember what this person sent BEFORE asking, so the log shows it.
-            log_line(chat_id, speaker, _short_summary(media, media_state, text, forward))
+            log_line(chat_id, speaker, _short_summary(media, media_state, text, forward),
+                     getattr(u.effective_user, "id", 0) or 0)
 
             ctx = await build_context(u, c.bot, lang, media_state, transcript, forward,
                                       want_voice, reply_media)
@@ -4259,7 +4320,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                     file_sent = True
                     log.info("auto-attached a file for chat %s (plain-word request)", chat_id)
 
-            log_line(chat_id, "Avenor", clean)
+            log_line(chat_id, "Avenor", clean, 0)      # the bot is not a user
 
             for url in find_image_urls(clean)[:2]:
                 # A URL the MODEL wrote is untrusted input. Everything else the bot fetches
@@ -4519,24 +4580,69 @@ async def _cleanup_loop() -> None:
 
 # ---- Reminder delivery ----------------------------------------------------------------
 REMINDER_CHECK = float(os.environ.get("REMINDER_CHECK", "30") or "30")
+# A failed reminder is retried with exponential backoff this many times before giving up.
+REMINDER_MAX_TRIES = max(1, int(os.environ.get("REMINDER_MAX_TRIES", "5") or "5"))
+REMINDER_MAX_BACKOFF = float(os.environ.get("REMINDER_MAX_BACKOFF", "1800") or "1800")
 _APP_BOT = None                    # set in _post_init; used by the reminder loop
 
 
+async def _deliver_reminder(b, r: dict) -> None:
+    """Send one reminder, to the person's DM when possible and to the origin chat otherwise.
+
+    A reminder is personal even when it was created in a group, so the DM is tried first. The
+    origin chat is the fallback, because a bot can only DM someone who has started it - and a
+    reminder must never vanish just because the person never opened a DM.
+    """
+    text = f"⏰ Reminder: {r.get('text')}"
+    uid = r.get("uid")
+    if uid:
+        try:
+            await b.send_message(chat_id=int(uid), text=text)
+            return
+        except Exception as e:  # noqa: BLE001
+            log.info("reminder DM failed (%s) - using the origin chat", str(e)[:100])
+    origin = r.get("chat_id")
+    if origin is None:
+        raise RuntimeError("reminder has no deliverable chat")
+    await b.send_message(chat_id=origin, text=text)
+
+
 async def _check_reminders_once(bot=None) -> int:
-    """Send every reminder that is due. Returns how many were sent (one pass - testable)."""
+    """Send every reminder that is due. Returns how many were sent (one pass - testable).
+
+    The reminder is removed only AFTER a successful send. It used to be popped first, so a
+    transient failure (Telegram down, a blocked bot) destroyed the reminder outright; now a
+    failure backs off and retries a bounded number of times, and the user is told if it
+    finally could not be delivered.
+    """
     if MEM is None:
         return 0
     b = bot or _APP_BOT
+    if b is None:
+        return 0
     sent = 0
     for r in MEM.due_reminders():
-        MEM.pop_reminder(r.get("id"))     # pop FIRST, so a failed send never loops forever
-        if b is None:
-            continue
+        rid = r.get("id")
+        tries = int(r.get("tries", 0) or 0)
         try:
-            await b.send_message(chat_id=r.get("chat_id"), text=f"⏰ Reminder: {r.get('text')}")
-            sent += 1
+            await _deliver_reminder(b, r)
         except Exception as e:  # noqa: BLE001
-            log.warning("reminder send failed: %s", str(e)[:120])
+            log.warning("reminder %s send failed (attempt %s): %s", rid, tries + 1,
+                        str(e)[:120])
+            if tries + 1 >= REMINDER_MAX_TRIES:
+                MEM.pop_reminder(rid)          # give up, but say so
+                try:
+                    await b.send_message(
+                        chat_id=r.get("chat_id") or int(r.get("uid") or 0),
+                        text=f"⚠️ Reminder could not be delivered: {r.get('text')}")
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                backoff = min(REMINDER_MAX_BACKOFF, 60.0 * (2 ** (tries + 1)))
+                MEM.reschedule_reminder(rid, tries + 1, time.time() + backoff)
+            continue
+        MEM.pop_reminder(rid)                  # delivered -> now it is safe to delete
+        sent += 1
     return sent
 
 
@@ -5798,7 +5904,7 @@ async def _send_proactive(bot, chat_id: int) -> None:
     """Compose and send ONE short, useful proactive note for this chat."""
     cs = MEM.chat_summary(chat_id) or ""
     topic = ""
-    for who, txt in reversed(CHAT_LOG.get(chat_id, [])):
+    for _uid, who, txt in reversed(CHAT_LOG.get(chat_id, [])):
         if who != "Avenor" and len(txt) > 12:
             topic = txt
             break
@@ -5863,18 +5969,19 @@ async def _proactive_loop(bot) -> None:
 
 
 async def _post_init(app) -> None:
+    global _APP_BOT, _READY
     # Clear any stale webhook so long polling never conflicts with one.
     try:
         await app.bot.delete_webhook(drop_pending_updates=DROP_PENDING_UPDATES)
         log.info("Webhook cleared; using long polling.")
     except Exception as e:  # noqa: BLE001
         log.warning("delete_webhook failed (ignored): %s", e)
-    global _APP_BOT
     _APP_BOT = app.bot
     app.create_task(_cleanup_loop())
     app.create_task(_proactive_loop(app.bot))          # no-op unless opted in
     app.create_task(_reminder_loop())                  # delivers reminders when due
     await _setup_commands(app)
+    _READY = True                                      # /ready starts answering 200
 
 
 async def _setup_commands(app) -> None:
@@ -6113,7 +6220,11 @@ async def cmd_papers(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         return
     res = await _arxiv_search(q, 5)
     if not res:
-        await _send_plain(c.bot, chat_id, "Us topic pe koi paper nahi mila. Doosre words try karo.")
+        await _send_plain(c.bot, chat_id, _msg(
+            _lang_for(u),
+            en="I found no paper on that topic. Try different words.",
+            hi="उस topic पर कोई paper नहीं मिला. दूसरे शब्द आज़माइए.",
+            hinglish="Us topic pe koi paper nahi mila. Doosre words try karo."))
         return
     for chunk in split_text(res, 3500):
         await _send_plain(c.bot, chat_id, chunk)
@@ -6143,7 +6254,11 @@ async def cmd_define(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as e:  # noqa: BLE001
             log.debug("define parse failed: %s", str(e)[:80])
     if not body:
-        await _send_plain(c.bot, chat_id, "Us word ka meaning nahi mila (ya service down hai).")
+        await _send_plain(c.bot, chat_id, _msg(
+            _lang_for(u),
+            en="I could not find a meaning for that word (or the dictionary service is down).",
+            hi="उस शब्द का अर्थ नहीं मिला (या dictionary service down है).",
+            hinglish="Us word ka meaning nahi mila (ya service down hai)."))
         return
     for chunk in split_text(body, 3500):
         await _send_plain(c.bot, chat_id, chunk)
@@ -6217,52 +6332,103 @@ async def cmd_privacy(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_remind(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     """Set a reminder from a command: /remind 30m drink water  (or  30m | drink water)."""
     chat_id = u.effective_chat.id
+    lang = _lang_for(u)
     if MEM is None:
-        await _send_plain(c.bot, chat_id, "Reminders abhi available nahi hain.")
+        await _send_plain(c.bot, chat_id, _msg(
+            lang,
+            en="Reminders are not available right now.",
+            hi="Reminders अभी उपलब्ध नहीं हैं.",
+            hinglish="Reminders abhi available nahi hain."))
         return
     arg = " ".join(c.args or []).strip()
     due, what = parse_reminder(arg)
     if not due or not what:
-        await _send_plain(c.bot, chat_id,
-                          "Format: /remind 30m <kaam>\n"
-                          "Time likhne ke tareeke: 10m, 2h, 1d, 'in 30 minutes'.")
+        await _send_plain(c.bot, chat_id, _msg(
+            lang,
+            en="Format: /remind 30m <task>\n"
+               "Time formats: 10m, 2h, 1d, 'in 30 minutes'.",
+            hi="Format: /remind 30m <काम>\n"
+               "समय: 10m, 2h, 1d, 'in 30 minutes'.",
+            hinglish="Format: /remind 30m <kaam>\n"
+                     "Time likhne ke tareeke: 10m, 2h, 1d, 'in 30 minutes'."))
         return
     rid = MEM.add_reminder(u.effective_user.id, chat_id, what, due)
     if not rid:
-        await _send_plain(c.bot, chat_id, "Reminder save nahi hua (limit bhar gaya ho sakta hai).")
+        await _send_plain(c.bot, chat_id, _msg(
+            lang,
+            en="The reminder was not saved (the per-user limit may be full).",
+            hi="Reminder save नहीं हुआ (limit भर गया हो सकता है).",
+            hinglish="Reminder save nahi hua (limit bhar gaya ho sakta hai)."))
         return
-    await _send_plain(c.bot, chat_id, f"⏰ Reminder #{rid} {_fmt_when(due)}: {what}")
+    where = ""
+    if getattr(u.effective_chat, "type", "private") != "private":
+        # A reminder is personal even when it was asked for in a group: it goes to the
+        # person's DM when they have one, and only falls back to this chat otherwise.
+        where = _msg(lang,
+                     en=" (I will send it to your private chat, or here if you have not "
+                        "messaged me directly yet.)",
+                     hi=" (मैं इसे आपके private chat में भेजूँगा, और अगर आपने मुझे सीधे "
+                        "message नहीं किया है तो यहीं भेजूँगा.)",
+                     hinglish=" (Private chat mein bhejunga, aur agar aapne mujhe direct "
+                              "message nahi kiya hai to yahin bhejunga.)")
+    await _send_plain(c.bot, chat_id, f"⏰ Reminder #{rid} {_fmt_when(due)}: {what}{where}")
 
 
 async def cmd_reminders(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     """List this person's own reminders (never anyone else's)."""
     chat_id = u.effective_chat.id
+    lang = _lang_for(u)
     if MEM is None:
-        await _send_plain(c.bot, chat_id, "Reminders abhi available nahi hain.")
+        await _send_plain(c.bot, chat_id, _msg(
+            lang,
+            en="Reminders are not available right now.",
+            hi="Reminders अभी उपलब्ध नहीं हैं.",
+            hinglish="Reminders abhi available nahi hain."))
         return
     rs = MEM.list_reminders(u.effective_user.id)
     if not rs:
-        await _send_plain(c.bot, chat_id, "Koi reminder set nahi hai.\n/remind 30m <kaam>")
+        await _send_plain(c.bot, chat_id, _msg(
+            lang,
+            en="No reminders set.\n/remind 30m <task>",
+            hi="कोई reminder सेट नहीं है.\n/remind 30m <काम>",
+            hinglish="Koi reminder set nahi hai.\n/remind 30m <kaam>"))
         return
-    lines = [f"⏰ Tumhare reminders ({len(rs)}):"]
+    lines = [_msg(lang, en=f"⏰ Your reminders ({len(rs)}):",
+                  hi=f"⏰ आपके reminders ({len(rs)}):",
+                  hinglish=f"⏰ Tumhare reminders ({len(rs)}):")]
     for r in rs[:20]:
         lines.append(f"#{r['id']} — {r['text']} ({_fmt_when(r['due'])})")
-    lines.append("\nHatane ke liye: /delremind <id>")
+    lines.append(_msg(lang, en="\nTo remove one: /delremind <id>",
+                      hi="\nहटाने के लिए: /delremind <id>",
+                      hinglish="\nHatane ke liye: /delremind <id>"))
     await _send_plain(c.bot, chat_id, "\n".join(lines))
 
 
 async def cmd_delremind(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     """Delete one of your own reminders by its id."""
     chat_id = u.effective_chat.id
+    lang = _lang_for(u)
     if MEM is None:
-        await _send_plain(c.bot, chat_id, "Reminders abhi available nahi hain.")
+        await _send_plain(c.bot, chat_id, _msg(
+            lang,
+            en="Reminders are not available right now.",
+            hi="Reminders अभी उपलब्ध नहीं हैं.",
+            hinglish="Reminders abhi available nahi hain."))
         return
     arg = (c.args or [""])[0] if c.args else ""
     rid = int(re.sub(r"[^0-9]", "", arg) or 0)
     if not rid or not MEM.del_reminder(u.effective_user.id, rid):
-        await _send_plain(c.bot, chat_id, "Us id ka koi reminder nahi mila. /reminders")
+        await _send_plain(c.bot, chat_id, _msg(
+            lang,
+            en="I have no reminder with that id. /reminders",
+            hi="उस id का कोई reminder नहीं मिला. /reminders",
+            hinglish="Us id ka koi reminder nahi mila. /reminders"))
         return
-    await _send_plain(c.bot, chat_id, f"🗑 Reminder #{rid} hata diya.")
+    await _send_plain(c.bot, chat_id, _msg(
+        lang,
+        en=f"🗑 Reminder #{rid} deleted.",
+        hi=f"🗑 Reminder #{rid} हटा दिया.",
+        hinglish=f"🗑 Reminder #{rid} hata diya."))
 
 
 async def cmd_proactive(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:

@@ -408,17 +408,37 @@ def add_reminder(user_id, chat_id, text: str, due: float) -> int:
         _DATA["seq"] = int(_DATA.get("seq", 0)) + 1
         rid = int(_DATA["seq"])
         rem[str(rid)] = {"uid": uid, "chat_id": chat_id, "text": text,
-                         "due": float(due), "created": int(time.time())}
+                         "due": float(due), "created": int(time.time()),
+                         "tries": 0, "next_try": 0.0}
     save()
     return rid
 
 
 def due_reminders(now=None) -> list:
+    """Reminders that are due AND not in a retry backoff."""
     load()
     now = time.time() if now is None else now
     with _LOCK:
         return [dict(r, id=int(k)) for k, r in (_DATA.get("reminders") or {}).items()
-                if float(r.get("due", 0)) <= now]
+                if float(r.get("due", 0)) <= now
+                and float(r.get("next_try", 0) or 0) <= now]
+
+
+def reschedule_reminder(rid, tries: int, next_try: float) -> bool:
+    """Keep a reminder that failed to send, with its retry count and next attempt time.
+
+    A reminder used to be POPPED before the send, so any transient Telegram failure deleted
+    it permanently - the user was simply never reminded and never told.
+    """
+    load()
+    with _LOCK:
+        r = (_DATA.get("reminders") or {}).get(str(rid))
+        if not r:
+            return False
+        r["tries"] = int(tries)
+        r["next_try"] = float(next_try)
+    save()
+    return True
 
 
 def pop_reminder(rid) -> dict:

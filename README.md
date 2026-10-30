@@ -24,7 +24,13 @@ The bot is meant to run as a long-lived service. It should work on any platform 
 - Reads photos, documents, voice notes, and audio
 - Understands plain requests with no command — say "make me a report" and it attaches the file, or "draw a logo" and it makes the image
 - Sets reminders and delivers them on time ("remind me in 2h to call mom"), with no external service
-- Reads a link you paste and answers about the page — news, blogs, and social links (Instagram, X, Reddit, Facebook all expose Open Graph data, which is read directly)
+- Reads a link you paste and answers about the page — news, blogs and social links
+- Reads social **posts**, not just their preview card, using public endpoints only (no API
+  key, no login, no app registration): X/Twitter, Reddit (post + top comments), Mastodon,
+  Bluesky (post + replies), TikTok, and public Telegram channels. Instagram, Facebook and
+  LinkedIn fall back to their Open Graph data, which is all they publish
+- `/skills` prints exactly what it can and cannot do — generated from the same table the
+  persona prompt uses, so the answer can never drift from the code
 - YouTube links too: title, channel, description and public captions — no browser, no key
 - Fetches politely and resiliently: per-host pacing, backoff + jitter on transient errors, and a per-host circuit breaker, so a site never blocks the bot
 - Reads RSS/Atom feeds — send a feed URL, or `/feed <url>`, and get its latest items
@@ -35,6 +41,9 @@ The bot is meant to run as a long-lived service. It should work on any platform 
 - Does exact arithmetic on request
 - Sends voice replies using text-to-speech
 - Picks a fitting emoji reaction for each message
+- Uses Telegram's own formatting properly: bold only on the phrase that matters, bullet
+  lists for 3+ items, `code` for commands and paths, `>` quotes, and `>>` for an
+  **expandable** quote that stays collapsed behind "show more"
 
 ---
 
@@ -92,7 +101,24 @@ All runtime settings come from environment variables. See `env.example.txt` for 
 
 ## Commands
 
-Command handlers are registered in `bot.py`. Check that file for the full list of commands and exactly what each one does.
+`/start` `/help` `/skills` `/about` `/id` `/info` — getting started and what it can do
+
+`/ai` `/research` `/image` — ask, look up the live web, make a picture
+
+`/voice on|off` `/voicemessage` `/setvoice` `/voicepreview` — voice replies
+
+`/remind 30m <task>` `/reminders` `/delremind <id>` — reminders
+
+`/feed <url>` `/papers <topic>` `/define <word>` `/holiday [cc]` — keyless lookups
+
+`/memory` (private chat only) `/forget` `/privacy` — your data
+
+`/rules` `/setup` `/welcome` `/stats` `/members` — group tools (admin-only where marked)
+
+`/diag` `/voicecreate` `/voicelist` `/voicefind` — owner only
+
+Everything else works without a command: send a photo, a voice note, a document, a link,
+or a plain sentence like "remind me in 2 hours to call mom".
 
 ---
 
@@ -168,6 +194,10 @@ not rediscover it the hard way.
 - **The JSON store does not scale indefinitely.** It is rewritten as a whole file, which is
   fine for a community bot and wrong for thousands of very active chats. The migration path is
   SQLite; the accessor functions in `memory.py` are the seam to swap.
+- **Social reading is best-effort.** The X, Reddit, Mastodon, Bluesky, TikTok and Telegram
+  endpoints are public and undocumented for this use, so any of them can rate-limit, change
+  shape, or block a datacenter IP without notice. Every one of them falls back to the page's
+  Open Graph data, and a failed read never fails the reply.
 - **Model-emitted action tags are trusted.** `[remember:]`, `[remind:]` and `[file:]` in the
   model's own output trigger real actions. User text cannot inject them (they are stripped from
   the transcript, and stored memory is sanitised on read), but a page the model *reads* could in

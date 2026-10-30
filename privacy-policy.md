@@ -10,7 +10,7 @@ here is aspirational.
 
 Avenor is a personal/community AI assistant that runs as a Telegram bot at **@AvenorAlBot**.
 The developer is Deepak Danodia (https://github.com/bydenvik). Contact:
-**coresovereign.official@gmail.com**.
+**contact.officialdeepak@gmail.com**.
 
 Avenor is not affiliated with, endorsed by, or operated by Telegram.
 
@@ -100,7 +100,7 @@ redeploys.
 - `/memory` — see what the bot has stored about you
 - `/forget` — delete everything the bot stored about you
 - `/reminders` and `/delremind` — manage your reminders
-- Email **coresovereign.official@gmail.com** to ask for access, correction or deletion
+- Email **contact.officialdeepak@gmail.com** to ask for access, correction or deletion
 - You may complain to your local data-protection authority
 
 ## 9. Children
@@ -123,4 +123,4 @@ repository (`privacy-policy.md`) and is available in the bot with `/privacy`.
 
 ## 12. Contact
 
-**coresovereign.official@gmail.com**
+**contact.officialdeepak@gmail.com**

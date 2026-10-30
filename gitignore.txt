@@ -18,6 +18,7 @@ dist/
 *.egg-info/
 
 # Runtime state - contains user IDs, names, notes and reminder text
+avenor_memory.json
 videx_memory.json
 linnet_memory.json
 *_memory.json

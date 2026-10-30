@@ -1,15 +1,16 @@
-# VIDEX | AI Companion
+# Avenor | AI Companion
 
 A Telegram AI bot written in Python. It holds conversations, understands media, remembers users across sessions, and can reply with text or voice.
 
-- Bot: https://t.me/Linnet_Agents_Bot  (the handle keeps its old name; the bot itself is VIDEX)
-- Repository: https://github.com/DeepakDevss/VIDEX_Al_Telegram_Bot
+- Bot: https://t.me/AvenorAlBot
+- Repository: https://github.com/bydenvik/VIDEX_Al_Telegram_Bot
+- Developer: https://github.com/bydenvik
 
 ---
 
 ## Overview
 
-VIDEX runs as a single Python process and talks to Telegram through the Bot API. Google Gemini is the main language model. Groq is used as a fallback chat provider and handles the speech-to-text side. User and chat state lives in a local JSON file managed by `memory.py`.
+Avenor runs as a single Python process and talks to Telegram through the Bot API. Google Gemini is the main language model. Groq is used as a fallback chat provider and handles the speech-to-text side. User and chat state lives in a local JSON file managed by `memory.py`.
 
 The bot is meant to run as a long-lived service. It should work on any platform that can run a Python process and set environment variables.
 
@@ -39,7 +40,7 @@ The bot is meant to run as a long-lived service. It should work on any platform 
 
 ## Requirements
 
-- Python 3.10 or newer
+- Python 3.10 or newer (tested on 3.12; nothing in the code needs newer than 3.9)
 - A Telegram bot token from BotFather
 - A Google AI Studio API key
 - A Groq API key
@@ -51,7 +52,7 @@ The bot is meant to run as a long-lived service. It should work on any platform 
 Clone the repo and install the dependencies:
 
 ```bash
-git clone https://github.com/DeepakDevss/VIDEX_Al_Telegram_Bot.git
+git clone https://github.com/bydenvik/VIDEX_Al_Telegram_Bot.git
 cd VIDEX_Al_Telegram_Bot
 
 python -m venv .venv
@@ -104,7 +105,8 @@ VIDEX_Al_Telegram_Bot/
 ├── requirements.txt    Python dependencies
 ├── env.example.txt     Environment variable template
 ├── privacy-policy.md   Privacy policy
-├── welcome.png         Image used in the group welcome message
+├── welcome.png         Optional group-welcome image (NOT included - the bot falls back
+│                       to a text card when it is absent)
 ├── LICENSE.txt         MIT
 └── README.md
 ```
@@ -113,7 +115,9 @@ VIDEX_Al_Telegram_Bot/
 
 ## Memory
 
-VIDEX keeps user and chat records in a JSON file, and the path is set through an environment variable. Writes happen atomically, so an interrupted write won't corrupt the file. The exact record layout is defined in `memory.py`.
+Avenor keeps user and chat records in a JSON file (`avenor_memory.json` by default), and the
+path is set through an environment variable. A file written under an earlier name of this bot
+(`videx_memory.json`, `linnet_memory.json`) is read once and migrated automatically. Writes happen atomically, so an interrupted write won't corrupt the file. The exact record layout is defined in `memory.py`.
 
 Memory is kept per user, keyed by their Telegram ID, and only ever injected into that person's own conversation — one person's facts are never shown to another. When enough notes accumulate, a background job merges and de-duplicates them into one short, clean profile. A user can see and wipe their own memory with `/memory` and `/forget`.
 
@@ -147,10 +151,10 @@ Memory is kept per user, keyed by their Telegram ID, and only ever injected into
 ## Data handling
 
 - All user and chat records are stored locally in the memory file. There's no external database.
-- Message content goes to Google Gemini and, when fallback kicks in, to Groq. If you run VIDEX in a regulated environment, review the provider policies that apply to you.
+- Message content goes to Google Gemini and, when fallback kicks in, to Groq. If you run Avenor in a regulated environment, review the provider policies that apply to you.
 - Credentials come from environment variables and are not part of the repository.
 
-If you run VIDEX as a public service, you are the data controller for the records it stores. See `privacy-policy.md`.
+If you run Avenor as a public service, you are the data controller for the records it stores. See `privacy-policy.md`.
 
 ---
 
@@ -167,7 +171,7 @@ Issues and pull requests are welcome.
 ## Related projects
 
 - **Ongoing Links** — A Telegram community bot with a force-join gate, welcome messages, referral tracking, and AI chat.
-  Repository: https://github.com/DeepakDevss/Ongoing_Links_Bot
+  Repository: https://github.com/bydenvik/Ongoing_Links_Bot
   Bot: https://t.me/ANIME_WORLD_8BOT
 
 ---
@@ -176,7 +180,7 @@ Issues and pull requests are welcome.
 
 Deepak Danodia
 
-- GitHub: https://github.com/DeepakDevss
+- GitHub: https://github.com/bydenvik
 - X: https://x.com/Deepak_Devs
 - Reddit: https://www.reddit.com/u/Deepak_Devs
 
